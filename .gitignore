@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# Run outputs (logs, checkpoints — too big and not source)
+runs/
+
+# Validation tensors (3 GB; reproducible via build_val_set.py)
+val_set_*.pt
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+
+# Local accelerate scratch
+.accelerate/
