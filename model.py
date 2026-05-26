@@ -20,22 +20,22 @@ class Projector(nn.Module):
 
 
 class CLIPModel(nn.Module):
-    """ResNet-50 (from scratch) + frozen BERT-base + two projectors + learned temperature.
+    """Pretrained image backbone + frozen sentence-embedding text encoder + projectors + learned temperature.
 
-    BERT is frozen because we already have a usable pretrained text encoder, and
-    unfreezing it would dominate the parameter count without much benefit on a
-    dataset this size. The image side has to learn everything from random init.
+    The text encoder is a modern retrieval-trained model (BGE by default) rather
+    than vanilla BERT — semantically much stronger embeddings for the same
+    parameter budget. Kept frozen, used as a fixed feature extractor.
     """
     def __init__(
         self,
-        image_backbone="resnet50",
-        text_backbone="bert-base-uncased",
+        image_backbone="tf_efficientnet_b1.aa_in1k",
+        text_backbone="BAAI/bge-base-en-v1.5",
         embed_dim=512,
         proj_hidden_dim=1024,
     ):
         super().__init__()
 
-        self.image_backbone = timm.create_model(image_backbone, pretrained=False, num_classes=0)
+        self.image_backbone = timm.create_model(image_backbone, pretrained=True, num_classes=0)
         self.text_backbone = AutoModel.from_pretrained(text_backbone)
 
         for p in self.text_backbone.parameters():
@@ -56,7 +56,10 @@ class CLIPModel(nn.Module):
     def encode_text(self, input_ids, attention_mask):
         with torch.no_grad():
             out = self.text_backbone(input_ids=input_ids, attention_mask=attention_mask)
-        return self.text_projector(out.pooler_output)
+        # BGE-style: use raw [CLS] hidden state (NOT pooler_output, which is BERT's
+        # tanh-projected variant tuned for NSP, not retrieval).
+        cls = out.last_hidden_state[:, 0]
+        return self.text_projector(cls)
 
     def forward(self, images, input_ids, attention_mask):
         img_emb = F.normalize(self.encode_image(images), dim=-1)

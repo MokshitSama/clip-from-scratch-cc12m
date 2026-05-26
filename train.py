@@ -32,15 +32,17 @@ from torch.amp import autocast
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 
-from build_loader import build_loader, BATCH_SIZE
+from build_loader import build_loader, build_val_loader, BATCH_SIZE
 from model import CLIPModel
 
 
-PAIRS_PER_EPOCH = 10_968_539 - 5_040            # cc12m minus held-out shard 0020
+# cc12m total - 200-shard val carveout. ~5040 pairs per shard on average, so
+# we lose ~1M training pairs to validation.
+PAIRS_PER_EPOCH = 10_968_539 - (200 * 5_040)
 RUNS_ROOT       = Path(__file__).parent / "runs"
-VAL_PATH        = Path(__file__).parent / "val_set_cc12m_0020_5000.pt"
 DEFAULT_CONFIG  = Path(__file__).parent / "config.yaml"
-EVAL_BATCH      = 256
+EVAL_BATCH      = 512                            # per-batch forward size during val
+SIM_CHUNK       = 1024                           # query chunk size for streaming retrieval
 AMP_DTYPE       = torch.bfloat16
 
 REQUIRED_KEYS = (
@@ -149,35 +151,78 @@ def clip_loss_gathered(local_img, local_txt, logit_scale, accelerator):
 
 
 @torch.no_grad()
-def eval_on_val(model, val_images, val_input_ids, val_attn_mask, device, set_train_mode):
-    """Run held-out eval and return R@{1,5,10} + mean_rank for both directions."""
+def streaming_metrics(img_emb, txt_emb, chunk=SIM_CHUNK):
+    """R@{1,5,10} + mean_rank in both directions, computed in query-chunks.
+
+    Avoids materialising the full NxN similarity matrix (which would be 4 TB
+    at N=1M). Memory peaks at chunk x N x 4 bytes (4 GB at chunk=1024, N=1M).
+    """
+    n = img_emb.shape[0]
+    device = img_emb.device
+    labels = torch.arange(n, device=device)
+    out = {}
+    for direction, queries, keys in [
+        ("i2t", img_emb, txt_emb),
+        ("t2i", txt_emb, img_emb),
+    ]:
+        hits1 = hits5 = hits10 = 0
+        rank_sum = 0.0
+        for i in range(0, n, chunk):
+            j = min(i + chunk, n)
+            sims = queries[i:j] @ keys.T                        # [chunk, N]
+            true_sim = sims.gather(1, labels[i:j].unsqueeze(1)) # [chunk, 1]
+            rank = (sims > true_sim).sum(dim=1) + 1             # 1-indexed
+            hits1    += (rank <= 1).sum().item()
+            hits5    += (rank <= 5).sum().item()
+            hits10   += (rank <= 10).sum().item()
+            rank_sum += rank.float().sum().item()
+        out[f"r@1_{direction}"]       = 100.0 * hits1  / n
+        out[f"r@5_{direction}"]       = 100.0 * hits5  / n
+        out[f"r@10_{direction}"]      = 100.0 * hits10 / n
+        out[f"mean_rank_{direction}"] = rank_sum / n
+    return out
+
+
+@torch.no_grad()
+def eval_on_val(model, val_loader, device, set_train_mode, log,
+                max_pairs=None, progress_every=50):
+    """Stream val_loader through the model, accumulate embeddings on GPU, then
+    do chunked retrieval. Returns (metrics_dict, n_pairs_seen)."""
     model.eval()
     img_chunks, txt_chunks = [], []
-    n = val_images.shape[0]
+    n_seen = 0
+    last_logged = 0
+    n_batches = 0
+
     with autocast(device_type="cuda", dtype=AMP_DTYPE):
-        for i in range(0, n, EVAL_BATCH):
-            j = min(i + EVAL_BATCH, n)
-            img_b = val_images[i:j].to(device, non_blocking=True)
-            ids_b = val_input_ids[i:j].to(device, non_blocking=True)
-            am_b  = val_attn_mask[i:j].to(device, non_blocking=True)
-            ie, te, _ = model(img_b, ids_b, am_b)
+        for batch in val_loader:
+            imgs, ids, mask = batch
+            imgs = imgs.to(device, non_blocking=True)
+            ids  = ids.to(device, non_blocking=True)
+            mask = mask.to(device, non_blocking=True)
+            ie, te, _ = model(imgs, ids, mask)
             img_chunks.append(ie.float())
             txt_chunks.append(te.float())
+            n_seen += imgs.shape[0]
+            n_batches += 1
+
+            if n_seen - last_logged >= progress_every * imgs.shape[0]:
+                log(f"    [eval] embedded {n_seen:,} pairs...")
+                last_logged = n_seen
+
+            if max_pairs is not None and n_seen >= max_pairs:
+                break
+
     set_train_mode()
 
     img_emb = torch.cat(img_chunks, dim=0)
     txt_emb = torch.cat(txt_chunks, dim=0)
-    sim = img_emb @ txt_emb.T
-    labels = torch.arange(sim.shape[0], device=sim.device)
+    if max_pairs is not None and img_emb.shape[0] > max_pairs:
+        img_emb = img_emb[:max_pairs]
+        txt_emb = txt_emb[:max_pairs]
 
-    out = {}
-    for direction, scores in [("i2t", sim), ("t2i", sim.T)]:
-        for k in (1, 5, 10):
-            topk = scores.topk(k, dim=1).indices
-            out[f"r@{k}_{direction}"] = (topk == labels[:, None]).any(dim=1).float().mean().item() * 100
-        ranks = (scores.argsort(dim=1, descending=True) == labels[:, None]).float().argmax(dim=1) + 1
-        out[f"mean_rank_{direction}"] = ranks.float().mean().item()
-    return out
+    log(f"    [eval] embedded {img_emb.shape[0]:,} pairs total; computing retrieval metrics...")
+    return streaming_metrics(img_emb, txt_emb), img_emb.shape[0]
 
 
 def save_ckpt(path, step, model, optimizer):
@@ -252,15 +297,11 @@ def main():
     log(f"Weight decay:      {cfg['weight_decay']}")
     log(f"Output:            {out_dir}")
 
-    if is_main:
-        log("Loading val set...")
-        val = torch.load(VAL_PATH, weights_only=False)
-        val_images, val_input_ids, val_attn_mask = val["images"], val["input_ids"], val["attention_mask"]
-        log(f"  val pairs: {val_images.shape[0]}")
-    else:
-        val_images = val_input_ids = val_attn_mask = None
+    # Val loader is built lazily inside the eval block (rank 0 only) so we don't
+    # spawn worker processes on the other ranks. Cap held-out at 1M pairs.
+    val_max_pairs = 1_000_000
 
-    log("Building data loader...")
+    log("Building train data loader...")
     loader = build_loader()
     loader_iter = iter(loader)
 
@@ -362,19 +403,25 @@ def main():
                 epoch_frac = (step + 1) / steps_per_epoch
                 new_path = ckpt_dir / f"ckpt_step{step+1:08d}.pt"
                 unwrapped = accelerator.unwrap_model(model)
+                log(f"  [eval] step {step+1:,} (epoch {epoch_frac:.2f}/{cfg['epochs']}): "
+                    f"saving ckpt + streaming up to {val_max_pairs:,} held-out pairs...")
                 save_ckpt(new_path, step + 1, unwrapped, optimizer)
 
+                # Build a fresh val loader each eval — webdataset iterators are
+                # consumed, and we want a deterministic full pass each time.
+                val_loader = build_val_loader(batch_size=EVAL_BATCH, num_workers=4)
+
                 t_eval = time.time()
-                m = eval_on_val(unwrapped, val_images, val_input_ids, val_attn_mask,
-                                device, set_train_mode)
+                m, n_val = eval_on_val(unwrapped, val_loader, device, set_train_mode,
+                                       log, max_pairs=val_max_pairs)
                 score = (m["r@1_i2t"] + m["r@1_t2i"]) / 2
 
                 log(f"  eval @ step {step+1:,}  (epoch frac {epoch_frac:.2f}/{cfg['epochs']}, "
-                    f"{time.time() - t_eval:.1f}s):")
+                    f"{time.time() - t_eval:.1f}s, n={n_val:,}):")
                 log(f"    i2t R@1 {m['r@1_i2t']:5.2f}%  R@5 {m['r@5_i2t']:5.2f}%  "
-                    f"R@10 {m['r@10_i2t']:5.2f}%  mean_rank {m['mean_rank_i2t']:6.1f}")
+                    f"R@10 {m['r@10_i2t']:5.2f}%  mean_rank {m['mean_rank_i2t']:7.1f}")
                 log(f"    t2i R@1 {m['r@1_t2i']:5.2f}%  R@5 {m['r@5_t2i']:5.2f}%  "
-                    f"R@10 {m['r@10_t2i']:5.2f}%  mean_rank {m['mean_rank_t2i']:6.1f}")
+                    f"R@10 {m['r@10_t2i']:5.2f}%  mean_rank {m['mean_rank_t2i']:7.1f}")
                 log(f"    avg R@1 = {score:.3f}%  (prev best {best_score:.3f}%)")
 
                 was_best = best_path is None or score > best_score

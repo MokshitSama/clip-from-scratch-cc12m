@@ -6,7 +6,7 @@ version: 1
 seed: 42
 
 # Length
-epochs: 5
+epochs: 20
 warmup_steps: 2000          # in total (cross-rank) optimizer steps
 
 # Optimizer
@@ -16,4 +16,4 @@ grad_clip: 1.0
 
 # Cadence
 log_every: 50               # in-batch metrics every N steps
-eval_every_frac: 4          # N evals per epoch (4 = quarter-epoch)
+eval_every_frac: 1          # N evals per epoch. 1 = once per epoch (~15-20 min per eval on 1M val).

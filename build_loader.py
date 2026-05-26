@@ -1,7 +1,7 @@
-"""WebDataset streaming loader for cc12m.
+"""WebDataset streaming loaders for cc12m.
 
-Shard 0020 is held out for the fixed validation set (see build_val_set.py),
-so training reads everything except that one shard.
+Shards 0020-0219 (200 shards, ~1M pairs) are held out as the validation set.
+Training reads the other 1976 shards (~9.96M pairs).
 """
 import webdataset as wds
 from braceexpand import braceexpand
@@ -11,16 +11,28 @@ from PIL import Image
 from io import BytesIO
 
 
-SHARDS = (
+# Train: everything except the 200-shard val range.
+TRAIN_SHARDS = (
     list(braceexpand("/mnt/md0/cc12m/cc12m-train-{0000..0019}.tar")) +
-    list(braceexpand("/mnt/md0/cc12m/cc12m-train-{0021..2175}.tar"))
+    list(braceexpand("/mnt/md0/cc12m/cc12m-train-{0220..2175}.tar"))
 )
+# Val: ~1M held-out pairs. Streamed at eval time (too big to preload).
+VAL_SHARDS = list(braceexpand("/mnt/md0/cc12m/cc12m-train-{0020..0219}.tar"))
+
+# Back-compat alias for callers that imported the old name.
+SHARDS = TRAIN_SHARDS
 
 IMAGE_SIZE   = 224
 MAX_TEXT_LEN = 64
 BATCH_SIZE   = 256
 NUM_WORKERS  = 8
 BUFFER_SIZE  = 4000
+
+# Tokenizer must match the text encoder used in model.py. BGE-base uses the
+# BertTokenizer with the same vocab as bert-base-uncased, so the tokenization
+# is byte-identical to the previous setup — but we point at the BGE repo so
+# any future divergence stays in sync.
+TEXT_ENCODER = "BAAI/bge-base-en-v1.5"
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD  = [0.229, 0.224, 0.225]
@@ -32,7 +44,7 @@ image_transform = transforms.Compose([
     transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
 ])
 
-tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
+tokenizer = AutoTokenizer.from_pretrained(TEXT_ENCODER)
 
 
 def preprocess(sample):
@@ -58,9 +70,10 @@ def preprocess(sample):
 
 
 def build_loader(batch_size=BATCH_SIZE, num_workers=NUM_WORKERS):
+    """Training loader. Infinite resampled stream, sharded across DDP ranks."""
     dataset = (
         wds.WebDataset(
-            SHARDS,
+            TRAIN_SHARDS,
             shardshuffle=False,
             resampled=True,
             nodesplitter=wds.split_by_node,   # each DDP rank gets a disjoint shard slice
@@ -72,6 +85,29 @@ def build_loader(batch_size=BATCH_SIZE, num_workers=NUM_WORKERS):
         .map(preprocess)
         .select(lambda x: x is not None)
         .batched(batch_size, partial=False)
+    )
+    return wds.WebLoader(dataset, batch_size=None, num_workers=num_workers, pin_memory=False)
+
+
+def build_val_loader(batch_size=512, num_workers=4):
+    """Validation loader. Finite, deterministic, single pass through VAL_SHARDS.
+
+    No shuffle, no resampling, no node split — eval runs on rank 0 only and
+    expects the exact same sequence of pairs every time so metrics are
+    reproducible across runs.
+    """
+    dataset = (
+        wds.WebDataset(
+            VAL_SHARDS,
+            shardshuffle=False,
+            resampled=False,
+            handler=wds.warn_and_continue,
+            empty_check=False,
+        )
+        .to_tuple("jpg", "txt")
+        .map(preprocess)
+        .select(lambda x: x is not None)
+        .batched(batch_size, partial=True)
     )
     return wds.WebLoader(dataset, batch_size=None, num_workers=num_workers, pin_memory=False)
 

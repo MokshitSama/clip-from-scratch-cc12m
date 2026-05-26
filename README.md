@@ -2,9 +2,12 @@
 
 A small implementation of [CLIP](https://arxiv.org/abs/2103.00020) trained from scratch on
 [CC12M](https://github.com/google-research-datasets/conceptual-12m) (~11M image–caption pairs).
-The image encoder is a ResNet-50 trained from random init; the text encoder is a frozen
-pretrained BERT-base used as a fixed feature extractor. Two small MLP projectors map both
-into a shared 512-dim space, and a learned temperature scales the cosine-similarity logits.
+The image encoder is a pretrained EfficientNet B1 (current default; swappable via the
+`image_backbone` arg in `model.py`). The text encoder is a frozen, pretrained sentence-
+embedding model — `BAAI/bge-base-en-v1.5` by default, a modern retrieval-trained model
+that drops in for BERT but with much stronger semantic embeddings. Two small MLP
+projectors map both into a shared 512-dim space, and a learned temperature scales the
+cosine-similarity logits.
 
 Multi-GPU with 🤗 Accelerate, using the OpenCLIP "gather features" trick so that the
 contrastive loss is computed over the full *global* batch rather than each rank's local
@@ -13,22 +16,22 @@ slice — i.e. on N GPUs at batch B per rank, every anchor sees N·B − 1 negat
 ## Architecture
 
 ```
-image (224x224) -> ResNet-50 (random init, trainable)   -> 2048 -> MLP -> 512 ─┐
-                                                                                 ├─ cosine sim
-text  (≤64 tok) -> BERT-base (pretrained, frozen)        ->  768 -> MLP -> 512 ─┘
-                                                                          ↑
-                                                              learned log-scale
-                                                              temperature (init 0)
+image (224x224) -> EfficientNet B1 (pretrained, trainable) -> 1280 -> MLP -> 512 ─┐
+                                                                                    ├─ cosine sim
+text  (≤64 tok) -> BGE-base-en-v1.5 (pretrained, frozen)    ->  768 -> MLP -> 512 ─┘
+                                                                             ↑
+                                                                 learned log-scale
+                                                                 temperature (init 0)
 ```
 
 | Component | Params | Notes |
 |---|---:|---|
-| ResNet-50 backbone | 23.5 M | from scratch |
-| BERT-base backbone | 110 M | frozen |
-| Image projector | 2.6 M | 2-layer MLP (GELU) |
+| EfficientNet B1 backbone | 6.5 M | ImageNet-pretrained, trainable |
+| BGE-base-en-v1.5 backbone | 109 M | frozen, `[CLS]` of last hidden state |
+| Image projector | 1.6 M | 2-layer MLP (GELU) |
 | Text projector | 1.3 M | 2-layer MLP (GELU) |
 | `log_scale` | 1 | learned |
-| **Trainable total** | **27.4 M** | |
+| **Trainable total** | **9.7 M** | |
 
 ## Files
 
@@ -60,14 +63,14 @@ Point `build_loader.SHARDS` at your cc12m tar files (they default to
 `/mnt/md0/cc12m/cc12m-train-{0000..2175}.tar` minus shard 0020, which is held out for
 validation).
 
-## Build the validation set (once)
+## Validation set
 
-```bash
-python build_val_set.py
-```
+The val set is streamed from cc12m shards **0020-0219** at eval time (~1M pairs).
+Nothing to pre-build — the loader just opens those shards each time eval runs.
+Training reads shards 0000-0019 + 0220-2175 (~9.96 M pairs).
 
-Materializes 5000 preprocessed (image, caption) pairs from cc12m shard 0020 into
-`val_set_cc12m_0020_5000.pt` (~3 GB). Done once per dataset; reused across all runs.
+The earlier `build_val_set.py` script pre-extracted 5,000 tensors to disk — kept
+around for historical compatibility but no longer used by `train.py`.
 
 ## Train
 
@@ -113,17 +116,52 @@ The contrastive temperature `log_scale` is a *learned* parameter (init 0 → sca
 to `exp(log_scale) ≤ 100` to prevent runaway. Init at scale 1 (flat softmax) forces the model
 to learn real embedding separation before the temperature can sharpen the loss artificially.
 
-## Notes on the from-scratch setup
+## Notes on the setup
 
-- BERT is frozen on purpose. Training BERT from random init alongside a from-scratch ResNet on
-  11M pairs would split a limited learning signal across too many parameters. A pretrained
-  BERT gives the text side a usable representation immediately and lets the image side catch up.
-- ResNet-50 was chosen over ViT-B/16 after a from-scratch ViT failed to converge in this
-  data regime — the conv inductive bias makes ResNets learn useful image features far faster
-  than ViTs on cc12m-sized datasets.
-- The MLP projectors use a hidden dim larger than the output dim (1024 → 512). Without the
-  hidden expansion, a single linear layer caps the achievable alignment between the two
-  encoder outputs.
+- The text encoder is frozen on purpose. Co-training a from-scratch text encoder
+  alongside a from-scratch (or pretrained) image encoder on 10 M pairs is not a
+  great use of capacity — frozen retrieval-trained text embeddings already give
+  the text side a strong representation, and the image side learns to align to
+  it. Original CLIP trained the text encoder from scratch, but they had 400 M
+  pairs and many more GPUs.
+- The MLP projectors use a hidden dim larger than the output dim (1024 → 512).
+  Original CLIP uses a *linear* projection (no hidden layer); they argue
+  non-linear projectors are co-adapted to self-supervised representation
+  learning and don't help here. Worth A/B testing.
+
+## Run log
+
+Every run lives in `runs/v{N}/` with a snapshot of its config and a `train.log`.
+Held-out **avg R@1** = mean of `R@1 i2t` and `R@1 t2i` on the fixed validation set.
+v1-v4 used a 5,000-pair val set (shard 0020). From v5 on, the val set is ~1M pairs
+(shards 0020-0219), so the held-out numbers across that boundary aren't 1:1 comparable —
+a 1M val is statistically more reliable but also a strictly harder problem.
+
+| Version | Doing what? | Change vs prev | Prediction | Actual (held-out avg R@1) | vs prev best |
+|---|---|---|---|---|---|
+| v1 | ViT-B/16 from scratch, 5 epochs, lr 1e-3, log_scale init 2.659 | initial baseline | should train slowly | **failed** — scale pinned at clamp(100) by step 3k, loss flat at log(batch), killed early | — |
+| v2 | ViT-B/16 from scratch, 5 epochs, lr 5e-4, log_scale init 0.0 | lower LR; flatter softmax init | scale climbs slowly, loss starts dropping post-warmup | scale healthy (3.99 at kill), loss 7.13, but held-out R@1 only 0.05% at 0.5 ep — killed early to swap backbone | no real progress |
+| v3 | ResNet-50 from scratch, 5 epochs | swap backbone ViT → ResNet-50 (random init) | conv inductive bias learns faster than ViT in this data regime | **R@1 = 4.03%** at end of 5 epochs | +4.03 |
+| v4 | ResNet-50 (pretrained ImageNet), 20 epochs | longer schedule; pretrained warm-start instead of random init | 20 epochs + pretrained should land ~8-15% | **R@1 = 6.70%** at epoch ~10.5 (run killed ~52% in, so this is a partial result) | +2.67 |
+| v5 | EfficientNet B1 (pretrained) + BGE-base text encoder, 1M val, 20 epochs, eval 1x/epoch | replaced ResNet-50 → EfficientNet B1 (6.5M vs 23.5M); BERT-base → BGE-base-en-v1.5 (same params, retrieval-trained); val 5k → 1M; eval 4x → 1x per epoch | smaller image bb might cap representation; BGE should noticeably improve text side; 1M val is more reliable but harder than 5k → R@1 numbers may look *lower* even if model is better | _to be filled in_ | _to be filled in_ |
+
+## Notes on choosing each piece
+
+- **Image backbone:** ResNet-50 was chosen over ViT-B/16 after from-scratch ViT
+  failed to converge on cc12m within 5 epochs. EfficientNet B1 is the current
+  choice — pretrained ImageNet weights, much smaller (~6.5 M trainable backbone),
+  faster per step. Pretrained weights skip the "learn to see" phase entirely.
+- **Text encoder:** Originally pretrained-frozen BERT-base. Switched to
+  pretrained-frozen `BAAI/bge-base-en-v1.5` — same parameter count, but BGE was
+  contrastively trained for retrieval, so its `[CLS]` representation is much
+  more useful for matching captions to images than BERT's pooler output (which
+  was tuned for sentence-pair classification).
+- **Projector:** 2-layer MLP (1024 → 512). Original CLIP uses a *linear* projection
+  and explicitly removes the SimCLR-style non-linear projector. Worth A/B-testing.
+- **Validation:** 1M pairs (shards 0020-0219, streamed at eval time). Statistical
+  noise floor on R@1 ≈ 0.01% — basically zero. 5k val was 0.07%.
+- **Eval cadence:** 1× per epoch. At 1M pairs each eval takes ~10-20 min, so
+  per-quarter-epoch evals would have doubled the wall-clock cost of every run.
 
 ## Status
 
