@@ -89,18 +89,29 @@ def build_loader(batch_size=BATCH_SIZE, num_workers=NUM_WORKERS):
     return wds.WebLoader(dataset, batch_size=None, num_workers=num_workers, pin_memory=False)
 
 
+def _no_node_split(src, group=None):
+    """Pass-through nodesplitter for the val loader.
+
+    Webdataset's default (`single_node_only`) raises if world_size > 1, even
+    though we only build the val loader on rank 0. We want rank 0 to see ALL
+    val shards, not its 1/world_size slice, so the splitter just yields
+    everything through.
+    """
+    yield from src
+
+
 def build_val_loader(batch_size=512, num_workers=4):
     """Validation loader. Finite, deterministic, single pass through VAL_SHARDS.
 
-    No shuffle, no resampling, no node split — eval runs on rank 0 only and
-    expects the exact same sequence of pairs every time so metrics are
-    reproducible across runs.
+    No shuffle, no resampling — eval runs on rank 0 only and expects the
+    exact same sequence of pairs every time so metrics are reproducible.
     """
     dataset = (
         wds.WebDataset(
             VAL_SHARDS,
             shardshuffle=False,
             resampled=False,
+            nodesplitter=_no_node_split,
             handler=wds.warn_and_continue,
             empty_check=False,
         )
