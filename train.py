@@ -24,12 +24,14 @@ import shutil
 import time
 from pathlib import Path
 
+import datetime
+
 import yaml
 import torch
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.amp import autocast
-from accelerate import Accelerator
+from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.utils import set_seed
 
 from build_loader import build_loader, build_val_loader, BATCH_SIZE
@@ -262,7 +264,11 @@ def main():
     ckpt_dir = out_dir / "checkpoints"
 
     set_seed(cfg["seed"])
-    accelerator = Accelerator()
+    # NCCL default timeout is 10 min. The 1M-pair eval on rank 0 takes ~30 min
+    # while other ranks block at wait_for_everyone(), so the default would fire
+    # the watchdog and kill the run. Bump to 2 h to give comfortable headroom.
+    ddp_kwargs = InitProcessGroupKwargs(timeout=datetime.timedelta(hours=2))
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     is_main = accelerator.is_local_main_process
     device  = accelerator.device
 
@@ -409,7 +415,9 @@ def main():
 
                 # Build a fresh val loader each eval — webdataset iterators are
                 # consumed, and we want a deterministic full pass each time.
-                val_loader = build_val_loader(batch_size=EVAL_BATCH, num_workers=4)
+                # Other ranks are blocked at wait_for_everyone() so rank 0 can
+                # use lots of workers without contending for CPU.
+                val_loader = build_val_loader(batch_size=EVAL_BATCH, num_workers=12)
 
                 t_eval = time.time()
                 m, n_val = eval_on_val(unwrapped, val_loader, device, set_train_mode,
