@@ -38,7 +38,11 @@ class CLIPModel(nn.Module):
         super().__init__()
 
         self.image_backbone = timm.create_model(image_backbone, pretrained=True, num_classes=0)
-        self.text_backbone = AutoModel.from_pretrained(text_backbone)
+        # add_pooling_layer=False skips BERT's pooler (Linear + Tanh on [CLS]).
+        # We use last_hidden_state[:, 0] directly, so the pooler weights would
+        # be unused — and DDP refuses to train models with unused parameters
+        # ("Parameter indices which did not receive grad...").
+        self.text_backbone = AutoModel.from_pretrained(text_backbone, add_pooling_layer=False)
 
         self.image_projector = Projector(self.image_backbone.num_features, proj_hidden_dim, embed_dim)
         self.text_projector  = Projector(self.text_backbone.config.hidden_size, proj_hidden_dim, embed_dim)
