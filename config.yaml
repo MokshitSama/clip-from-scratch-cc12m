@@ -10,7 +10,11 @@ epochs: 20
 warmup_steps: 2000          # in total (cross-rank) optimizer steps
 
 # Optimizer
-base_lr: 5e-4               # AdamW; bumped to 1e-3 for from-scratch ResNet runs
+base_lr: 5e-4               # AdamW peak LR for the projector / head params
+backbone_lr_mult: 0.2       # backbone LR = base_lr * backbone_lr_mult.
+                            # 0.2 -> 1e-4 for ImageNet-pretrained image bb + retrieval-trained
+                            # text bb (gentler updates preserve pretrained features).
+                            # Set to 1.0 for single-LR behaviour (no two-group split).
 weight_decay: 0.1
 grad_clip: 1.0
 

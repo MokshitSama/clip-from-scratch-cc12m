@@ -34,7 +34,7 @@ from torch.amp import autocast
 from accelerate import Accelerator, InitProcessGroupKwargs
 from accelerate.utils import set_seed
 
-from build_loader import build_loader, build_val_loader, BATCH_SIZE
+from dataset import build_loader, build_val_loader, BATCH_SIZE
 from model import CLIPModel
 
 
@@ -48,7 +48,7 @@ SIM_CHUNK       = 1024                           # query chunk size for streamin
 AMP_DTYPE       = torch.bfloat16
 
 REQUIRED_KEYS = (
-    "version", "epochs", "warmup_steps", "base_lr",
+    "version", "epochs", "warmup_steps", "base_lr", "backbone_lr_mult",
     "weight_decay", "grad_clip", "eval_every_frac", "log_every", "seed",
 )
 
@@ -76,15 +76,16 @@ def load_config(path, version_override):
         raise RuntimeError(f"{path} missing keys: {missing}")
 
     # YAML can be loose about types; be explicit.
-    cfg["version"]         = int(cfg["version"])
-    cfg["epochs"]          = int(cfg["epochs"])
-    cfg["warmup_steps"]    = int(cfg["warmup_steps"])
-    cfg["base_lr"]         = float(cfg["base_lr"])
-    cfg["weight_decay"]    = float(cfg["weight_decay"])
-    cfg["grad_clip"]       = float(cfg["grad_clip"])
-    cfg["eval_every_frac"] = int(cfg["eval_every_frac"])
-    cfg["log_every"]       = int(cfg["log_every"])
-    cfg["seed"]            = int(cfg["seed"])
+    cfg["version"]           = int(cfg["version"])
+    cfg["epochs"]            = int(cfg["epochs"])
+    cfg["warmup_steps"]      = int(cfg["warmup_steps"])
+    cfg["base_lr"]           = float(cfg["base_lr"])
+    cfg["backbone_lr_mult"]  = float(cfg["backbone_lr_mult"])
+    cfg["weight_decay"]      = float(cfg["weight_decay"])
+    cfg["grad_clip"]         = float(cfg["grad_clip"])
+    cfg["eval_every_frac"]   = int(cfg["eval_every_frac"])
+    cfg["log_every"]         = int(cfg["log_every"])
+    cfg["seed"]              = int(cfg["seed"])
     return cfg
 
 
@@ -102,12 +103,13 @@ def make_logger(out_dir, is_main):
     return log
 
 
-def lr_at_step(step, total_steps, warmup, base_lr):
-    """Linear warmup then cosine decay to 0."""
+def lr_schedule_factor(step, total_steps, warmup):
+    """Returns a multiplier in [0, 1]: linear warmup, then cosine decay to 0.
+    Applied per-param-group against that group's base_lr in the train loop."""
     if step < warmup:
-        return base_lr * (step + 1) / warmup
+        return (step + 1) / warmup
     progress = min((step - warmup) / max(1, total_steps - warmup), 1.0)
-    return base_lr * 0.5 * (1.0 + math.cos(math.pi * progress))
+    return 0.5 * (1.0 + math.cos(math.pi * progress))
 
 
 def gather_features(local_img, local_txt, accelerator):
@@ -228,11 +230,12 @@ def eval_on_val(model, val_loader, device, set_train_mode, log,
 
 
 def save_ckpt(path, step, model, optimizer):
-    """Save everything except the frozen BERT (duplicates pretrained weights)."""
+    """Save the full model + optimizer state. Both backbones are trainable
+    now, so we can't shortcut by skipping the text encoder anymore.
+    Checkpoint size jumps from ~50MB to ~500MB+ because of this."""
     torch.save({
         "step": step,
-        "model_state": {k: v for k, v in model.state_dict().items()
-                        if not k.startswith("text_backbone")},
+        "model_state": model.state_dict(),
         "optimizer_state": optimizer.state_dict(),
     }, path)
 
@@ -299,7 +302,8 @@ def main():
     log(f"Total steps:       {total_steps:,}")
     log(f"Eval every:        {eval_every:,} steps  ({cfg['eval_every_frac']}x per epoch)")
     log(f"Warmup:            {cfg['warmup_steps']} steps")
-    log(f"Base LR:           {cfg['base_lr']}")
+    log(f"Base LR (head):    {cfg['base_lr']}")
+    log(f"Backbone LR mult:  {cfg['backbone_lr_mult']}  (backbone LR = {cfg['base_lr'] * cfg['backbone_lr_mult']:.2e})")
     log(f"Weight decay:      {cfg['weight_decay']}")
     log(f"Output:            {out_dir}")
 
@@ -316,32 +320,51 @@ def main():
     n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log(f"  trainable params: {n_trainable:,}")
 
-    # Weight decay grouping: skip 1D params (biases, LN), the temperature, and
-    # ViT-style positional / cls tokens (no-op for ResNet but harmless to keep).
-    NO_DECAY_KEYS = ("log_scale", "pos_embed", "cls_token")
-    decay, no_decay = [], []
+    # 4-way param grouping: backbone vs head, cross weight_decay vs no_decay.
+    #   - Backbones (image + text) get base_lr * backbone_lr_mult — gentler updates
+    #     so we don't catastrophically forget the pretrained features.
+    #   - Head params (projectors + log_scale) get the full base_lr.
+    #   - No-decay set = 1D params (biases, LayerNorm), the learned temperature,
+    #     and ViT-style positional / cls tokens (no-op for ResNet/EfficientNet
+    #     but harmless to keep in the rule).
+    NO_DECAY_KEYS     = ("log_scale", "pos_embed", "cls_token")
+    BACKBONE_PREFIXES = ("image_backbone", "text_backbone")
+
+    bb_decay, bb_no_decay, head_decay, head_no_decay = [], [], [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        if p.ndim < 2 or any(k in n for k in NO_DECAY_KEYS):
-            no_decay.append(p)
-        else:
-            decay.append(p)
-    log(f"  decay group:    {len(decay)} tensors, {sum(p.numel() for p in decay):,} params")
-    log(f"  no-decay group: {len(no_decay)} tensors, {sum(p.numel() for p in no_decay):,} params")
+        is_backbone = any(n.startswith(prefix) for prefix in BACKBONE_PREFIXES)
+        is_no_decay = p.ndim < 2 or any(k in n for k in NO_DECAY_KEYS)
+        target = (bb_no_decay if is_no_decay else bb_decay) if is_backbone \
+                 else (head_no_decay if is_no_decay else head_decay)
+        target.append(p)
 
+    backbone_lr = cfg["base_lr"] * cfg["backbone_lr_mult"]
+    head_lr     = cfg["base_lr"]
+
+    def _count(params): return sum(p.numel() for p in params)
+    log(f"  backbone decay:    {len(bb_decay):>4} tensors, {_count(bb_decay):>12,} params  lr={backbone_lr}")
+    log(f"  backbone no_decay: {len(bb_no_decay):>4} tensors, {_count(bb_no_decay):>12,} params  lr={backbone_lr}")
+    log(f"  head decay:        {len(head_decay):>4} tensors, {_count(head_decay):>12,} params  lr={head_lr}")
+    log(f"  head no_decay:     {len(head_no_decay):>4} tensors, {_count(head_no_decay):>12,} params  lr={head_lr}")
+
+    # `base_lr` per group is stashed for the cosine schedule to pick up below.
     optimizer = torch.optim.AdamW(
-        [{"params": decay,    "weight_decay": cfg["weight_decay"]},
-         {"params": no_decay, "weight_decay": 0.0}],
-        lr=cfg["base_lr"], betas=(0.9, 0.98), eps=1e-6,
+        [
+            {"params": bb_decay,      "lr": backbone_lr, "weight_decay": cfg["weight_decay"], "base_lr": backbone_lr},
+            {"params": bb_no_decay,   "lr": backbone_lr, "weight_decay": 0.0,                 "base_lr": backbone_lr},
+            {"params": head_decay,    "lr": head_lr,     "weight_decay": cfg["weight_decay"], "base_lr": head_lr},
+            {"params": head_no_decay, "lr": head_lr,     "weight_decay": 0.0,                 "base_lr": head_lr},
+        ],
+        betas=(0.9, 0.98), eps=1e-6,
     )
 
     model, optimizer = accelerator.prepare(model, optimizer)
 
     def set_train_mode():
-        # model.train() flips everything including BERT — re-pin it to eval.
+        # Both backbones are trainable now — single .train() does the right thing.
         model.train()
-        accelerator.unwrap_model(model).text_backbone.eval()
     set_train_mode()
 
     log("Starting training loop...")
@@ -363,9 +386,10 @@ def main():
 
         images, input_ids, attention_mask = (x.to(device, non_blocking=True) for x in batch)
 
-        lr_now = lr_at_step(step, total_steps, cfg["warmup_steps"], cfg["base_lr"])
+        # Same cosine schedule for both groups, just scaled by each group's base_lr.
+        factor = lr_schedule_factor(step, total_steps, cfg["warmup_steps"])
         for g in optimizer.param_groups:
-            g["lr"] = lr_now
+            g["lr"] = g["base_lr"] * factor
 
         with autocast(device_type="cuda", dtype=AMP_DTYPE):
             img_emb, txt_emb, logit_scale = model(images, input_ids, attention_mask)
