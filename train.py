@@ -421,9 +421,13 @@ def main():
             sps = (cfg["log_every"] * global_batch) / (now - t_log)
             t_log = now
 
+            # head LR (group 2 = head_decay) is the "primary" LR for the log;
+            # backbone LR follows as base_lr * backbone_lr_mult * same_factor.
+            head_lr_now = optimizer.param_groups[2]["lr"]
+            bb_lr_now   = optimizer.param_groups[0]["lr"]
             log(f"step {step+1:6d}/{total_steps} | "
                 f"loss {avg_loss:.4f} | scale {logit_scale.item():.2f} | "
-                f"lr {lr_now:.2e} | "
+                f"lr {head_lr_now:.2e}/{bb_lr_now:.2e} (head/bb) | "
                 f"R@1 i2t {avg_i2t*100:5.1f}% | R@1 t2i {avg_t2i*100:5.1f}% | "
                 f"{sps:.0f} samples/s")
 
