@@ -142,7 +142,7 @@ def build_loader(batch_size: int = BATCH_SIZE,
         pipeline,
         batch_size=None,                           # already batched in the pipeline
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=False,         # disabled: hit CUDA "invalid format" with wds + pinned tensors
         persistent_workers=num_workers > 0,
     )
 
@@ -167,7 +167,7 @@ def build_val_loader(batch_size: int = 512,
         pipeline,
         batch_size=None,
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=False,         # disabled: hit CUDA "invalid format" with wds + pinned tensors
         persistent_workers=False,
     )
 
