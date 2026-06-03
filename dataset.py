@@ -1,21 +1,22 @@
-"""cc12m streaming pipeline: WebDataset for TAR parsing, torch DataLoader on top.
+"""cc12m streaming pipeline: WebDataset end-to-end (parsing + loader).
 
-We keep wds for what it's good at (sequential tar iteration, per-rank /
-per-worker shard splitting, sample-level shuffle buffer) and replace its
-`WebLoader` with the real `torch.utils.data.DataLoader` — which gives us
-batching, drop_last, persistent_workers, and a familiar API.
+WebDataset spawns N worker processes via the same DataLoader-style machinery
+as torch (wds.WebLoader is literally a thin subclass of
+torch.utils.data.DataLoader). So data loading is concurrent across CPU
+cores — each worker runs its own tar-iterate, decode, augment, tokenize
+pipeline in parallel, and yields batches to the main process.
 
 DDP shard splitting:
-    `nodesplitter=split_by_node` + `workersplitter=split_by_worker` (with
-    `resampled=False`, the default) gives **strictly disjoint** shard
-    slices across (rank x dataloader_worker) — every shard is consumed by
-    exactly one worker process per epoch.
+    nodesplitter=split_by_node + workersplitter=split_by_worker (with
+    resampled=False, the default) gives **strictly disjoint** shard slices
+    across (rank x worker) — every shard is consumed by exactly one worker
+    process per epoch.
 
 Augmentation:
     Train uses albumentations with RandomResizedCrop / HFlip / ColorJitter
     — standard for image-text contrastive (cc12m-scale wants more aug than
     the original CLIP recipe of "random square crop only" because cc12m is
-    ~100x smaller than the WIT400M CLIP was trained on).
+    ~100x smaller than WIT400M).
     Val uses a deterministic Resize+CenterCrop — must match exactly across
     runs so eval is reproducible.
 """
@@ -30,7 +31,6 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from braceexpand import braceexpand
 from PIL import Image
-from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 
 
@@ -119,36 +119,36 @@ def _passthrough_node(src, group=None):
 # ---------------------------------------------------------------------------
 def build_loader(batch_size: int = BATCH_SIZE,
                  num_workers: int = NUM_WORKERS,
-                 shuffle_buffer: int = SHUFFLE_BUFFER) -> DataLoader:
+                 shuffle_buffer: int = SHUFFLE_BUFFER) -> wds.WebLoader:
     """Train loader. Strict per-(rank, worker) disjoint shard splits, shuffled
-    shard order each epoch, sample-level shuffle buffer."""
+    shard order each epoch, sample-level shuffle buffer. Batching happens
+    inside the pipeline (`.batched(...)`) — wds.WebLoader is told
+    `batch_size=None` because batches are already constructed upstream."""
     pipeline = (
         wds.WebDataset(
             TRAIN_SHARDS,
             shardshuffle=SHARD_SHUFFLE,
             nodesplitter=wds.split_by_node,        # split shards across DDP ranks
-            workersplitter=wds.split_by_worker,    # then across DataLoader workers
+            workersplitter=wds.split_by_worker,    # then across loader workers
             handler=wds.warn_and_continue,
             empty_check=False,
         )
         .shuffle(shuffle_buffer)
         .to_tuple("jpg", "txt")
         .map(_preprocess_train, handler=wds.warn_and_continue)
+        .batched(batch_size, partial=False)        # contrastive needs uniform B
     )
-    return DataLoader(
+    return wds.WebLoader(
         pipeline,
-        batch_size=batch_size,
+        batch_size=None,                           # already batched in the pipeline
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=True,                           # contrastive needs uniform batch size
         persistent_workers=num_workers > 0,
-        # No sampler / no shuffle arg — those don't apply to IterableDataset;
-        # wds handles ordering above.
     )
 
 
 def build_val_loader(batch_size: int = 512,
-                     num_workers: int = 12) -> DataLoader:
+                     num_workers: int = 12) -> wds.WebLoader:
     """Val loader. Single deterministic pass over VAL_SHARDS on rank 0 only."""
     pipeline = (
         wds.WebDataset(
@@ -161,14 +161,14 @@ def build_val_loader(batch_size: int = 512,
         )
         .to_tuple("jpg", "txt")
         .map(_preprocess_val, handler=wds.warn_and_continue)
+        .batched(batch_size, partial=True)         # keep final partial batch on val
     )
-    return DataLoader(
+    return wds.WebLoader(
         pipeline,
-        batch_size=batch_size,
+        batch_size=None,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=False,                          # keep the final partial val batch
-        persistent_workers=False,                 # val loader is short-lived, no need
+        persistent_workers=False,
     )
 
 
