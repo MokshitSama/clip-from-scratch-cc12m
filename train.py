@@ -44,7 +44,11 @@ PAIRS_PER_EPOCH = 10_968_539 - (200 * 5_040)
 RUNS_ROOT       = Path(__file__).parent / "runs"
 DEFAULT_CONFIG  = Path(__file__).parent / "config.yaml"
 EVAL_BATCH      = 512                            # per-batch forward size during val
-SIM_CHUNK       = 1024                           # query chunk size for streaming retrieval
+SIM_CHUNK       = 512                            # query chunk size for streaming retrieval.
+                                                 # 512 * 1_000_000 fp32 = 2 GB peak per chunk
+                                                 # — was 1024 (4 GB), but fragmented cache
+                                                 # after the first eval caused silent OOM on
+                                                 # the second. See issue #6.
 AMP_DTYPE       = torch.bfloat16
 
 REQUIRED_KEYS = (
@@ -159,8 +163,14 @@ def streaming_metrics(img_emb, txt_emb, chunk=SIM_CHUNK):
     """R@{1,5,10} + mean_rank in both directions, computed in query-chunks.
 
     Avoids materialising the full NxN similarity matrix (which would be 4 TB
-    at N=1M). Memory peaks at chunk x N x 4 bytes (4 GB at chunk=1024, N=1M).
+    at N=1M). Memory peaks at chunk x N x 4 bytes (2 GB at chunk=512, N=1M).
+
+    Releases the CUDA caching allocator's free blocks before allocating the
+    first big sims chunk — training fragments the cache, and even though
+    plenty of memory is technically free, the contiguous block we need can
+    fail to allocate without empty_cache (see issue #6).
     """
+    torch.cuda.empty_cache()
     n = img_emb.shape[0]
     device = img_emb.device
     labels = torch.arange(n, device=device)
@@ -225,8 +235,21 @@ def eval_on_val(model, val_loader, device, set_train_mode, log,
         img_emb = img_emb[:max_pairs]
         txt_emb = txt_emb[:max_pairs]
 
+    # Free the per-batch chunk lists (their tensors are now in img_emb / txt_emb).
+    # Then release cached free blocks so the big sims chunks in streaming_metrics
+    # have contiguous room. See issue #6.
+    del img_chunks, txt_chunks
+    torch.cuda.empty_cache()
+
     log(f"    [eval] embedded {img_emb.shape[0]:,} pairs total; computing retrieval metrics...")
-    return streaming_metrics(img_emb, txt_emb), img_emb.shape[0]
+    metrics = streaming_metrics(img_emb, txt_emb)
+    n_pairs = img_emb.shape[0]
+
+    # Drop the embeddings before returning to the training loop, so training's
+    # next forward+backward has a clean cache to work with.
+    del img_emb, txt_emb
+    torch.cuda.empty_cache()
+    return metrics, n_pairs
 
 
 def save_ckpt(path, step, model, optimizer):
