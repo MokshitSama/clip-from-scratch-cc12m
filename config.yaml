@@ -7,7 +7,9 @@ seed: 42
 
 # Length
 epochs: 20
-warmup_steps: 2000          # in total (cross-rank) optimizer steps
+warmup_steps: 1000          # in total (cross-rank) optimizer steps.
+                            # Halved from 2000 when per-rank batch went 256 -> 512
+                            # (steps/epoch halved; keeps warmup at the same ~0.3 epoch).
 
 # Optimizer
 base_lr: 5e-4               # AdamW peak LR for the projector / head params
