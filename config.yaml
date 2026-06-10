@@ -12,14 +12,15 @@ warmup_steps: 1000          # in total (cross-rank) optimizer steps.
                             # (steps/epoch halved; keeps warmup at the same ~0.3 epoch).
 
 # Optimizer
-base_lr: 5e-4               # AdamW peak LR for the projector / head params
-backbone_lr_mult: 0.2       # backbone LR = base_lr * backbone_lr_mult.
-                            # 0.2 -> 1e-4 for ImageNet-pretrained image bb + retrieval-trained
-                            # text bb (gentler updates preserve pretrained features).
-                            # Set to 1.0 for single-LR behaviour (no two-group split).
+base_lr: 1e-3               # AdamW peak LR for all params (head and backbone)
+backbone_lr_mult: 1.0       # backbone LR = base_lr * backbone_lr_mult.
+                            # 1.0 = single-LR, no head/backbone split. Raised from
+                            # 5e-4 / 0.2 after the global batch doubled to 3072.
 weight_decay: 0.1
 grad_clip: 1.0
 
 # Cadence
 log_every: 50               # in-batch metrics every N steps
 eval_every_frac: 1          # N evals per epoch. 1 = once per epoch (~15-20 min per eval on 1M val).
+profile: true               # print [prof] phase timings + [data-wait/rank] every log window.
+                            # Costs a few GPU syncs per step; turn off once you trust the pipeline.

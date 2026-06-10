@@ -85,6 +85,7 @@ def load_config(path, version_override):
     cfg["eval_every_frac"]  = int(cfg["eval_every_frac"])
     cfg["log_every"]        = int(cfg["log_every"])
     cfg["seed"]             = int(cfg["seed"])
+    cfg["profile"]          = bool(cfg.get("profile", True))   # optional key, on by default
     return cfg
 
 
@@ -432,7 +433,7 @@ def main():
     set_train_mode()
 
     log("Starting training loop (cudnn.benchmark on, torch.compile on, fused AdamW)...")
-    prof = StepProfiler(enabled=is_main)
+    prof = StepProfiler(enabled=is_main and cfg["profile"])
     t_start = t_log = time.time()
     step = 0
     running_loss = running_acc_i2t = running_acc_t2i = 0.0
@@ -490,20 +491,21 @@ def main():
             log(f"step {step+1:6d}/{total_steps} | loss {avg_loss:.4f} | scale {logit_scale.item():.2f} | "
                 f"lr {head_lr_now:.2e}/{bb_lr_now:.2e} (head/bb) | "
                 f"R@1 i2t {avg_i2t*100:5.1f}% | R@1 t2i {avg_t2i*100:5.1f}% | {sps:.0f} samples/s")
-            prof_msg = prof.report()
-            if prof_msg:
-                log(prof_msg)
-            # Each rank reports how long it sat waiting for data this window.
-            # This is the line that finds stragglers: a stall on any single
-            # rank is invisible in that rank's own [prof] (which only rank 0
-            # prints) but shows up here by name.
-            wait_ms = torch.tensor([prefetcher.pop_wait_ms() / cfg["log_every"]], device=device)
-            if accelerator.num_processes > 1:
-                waits = [torch.zeros_like(wait_ms) for _ in range(accelerator.num_processes)]
-                dist.all_gather(waits, wait_ms)
-                log("[data-wait/rank] " + "  ".join(f"r{i} {w.item():6.1f}" for i, w in enumerate(waits)) + "  ms/step")
-            else:
-                log(f"[data-wait/rank] r0 {wait_ms.item():6.1f} ms/step")
+            if cfg["profile"]:
+                prof_msg = prof.report()
+                if prof_msg:
+                    log(prof_msg)
+                # Each rank reports how long it sat waiting for data this
+                # window. This is the line that finds stragglers: a stall on
+                # any single rank is invisible in rank 0's [prof] but shows
+                # up here by name. All ranks must execute the all_gather.
+                wait_ms = torch.tensor([prefetcher.pop_wait_ms() / cfg["log_every"]], device=device)
+                if accelerator.num_processes > 1:
+                    waits = [torch.zeros_like(wait_ms) for _ in range(accelerator.num_processes)]
+                    dist.all_gather(waits, wait_ms)
+                    log("[data-wait/rank] " + "  ".join(f"r{i} {w.item():6.1f}" for i, w in enumerate(waits)) + "  ms/step")
+                else:
+                    log(f"[data-wait/rank] r0 {wait_ms.item():6.1f} ms/step")
 
         if (step + 1) % eval_every == 0:
             accelerator.wait_for_everyone()
