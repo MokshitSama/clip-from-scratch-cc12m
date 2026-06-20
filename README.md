@@ -146,10 +146,8 @@ own GitHub issue with measurements + fix details:
 | [#13](https://github.com/MokshitSama/clip-from-scratch-cc12m/issues/13) | albumentations CPU aug per sample → GPU stalled at 30-70% util | Move RandomResizedCrop + HFlip + ColorJitter + Normalize to GPU; RRC+flip fold into one affine matrix consumed by `F.grid_sample` | **~5.5 ms / B=256** on a 3090; CPU workers just decode + resize-to-256 |
 | [#14](https://github.com/MokshitSama/clip-from-scratch-cc12m/issues/14) | 50 MB/batch sync H2D blocked next forward | `PinnedPrefetcher`: side stream + persistent pinned host buffers; H2D for batch N+1 overlaps with compute on batch N | **~11% wall-clock** on a synthetic 50-batch bench (4.65 s → 4.12 s) |
 
-Real bugs caught while landing the above are tracked separately:
-[#9](https://github.com/MokshitSama/clip-from-scratch-cc12m/issues/9) (OOM on 3090 at bs=256),
-[#11](https://github.com/MokshitSama/clip-from-scratch-cc12m/issues/11) (concurrent memmap allocation race),
-[#15](https://github.com/MokshitSama/clip-from-scratch-cc12m/issues/15) (`non_blocking=True` is silently sync without a pinned source — the classic prefetcher gotcha).
+Worth-knowing gotcha caught while landing the above:
+[#15](https://github.com/MokshitSama/clip-from-scratch-cc12m/issues/15) — `non_blocking=True` is silently sync without a pinned source. The classic prefetcher trap; a side-stream copy that *looks* async will silently fall back to a default-stream sync copy if the host tensor isn't pinned.
 
 The training rewrite that actually consumes all three speedups (`train_precomp.py` — text tower removed, memmap row lookup at the index, `GPUTrainTransform`, `PinnedPrefetcher`) is in progress.
 
