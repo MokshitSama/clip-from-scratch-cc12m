@@ -36,12 +36,18 @@ text  (≤64 tok) -> BGE-base-en-v1.5 (pretrained, frozen)    ->  768 -> MLP -> 
 ## Files
 
 ```
-model.py          # CLIPModel + clip_loss + Projector
-build_loader.py   # WebDataset streaming loader over cc12m shards
-build_val_set.py  # one-shot script to materialize the held-out val tensors
-train.py          # multi-GPU training loop with gathered-features contrastive loss
-evaluate.py       # eval R@{1,5,10} + mean rank on a checkpoint
-config.yaml       # all tunable hyperparameters
+model.py              # CLIPModel + clip_loss + Projector
+build_loader.py       # WebDataset streaming loader over cc12m shards
+build_val_set.py      # one-shot script to materialize the held-out val tensors
+train.py              # multi-GPU training loop with gathered-features contrastive loss
+evaluate.py           # eval R@{1,5,10} + mean rank on a checkpoint
+config.yaml           # all tunable hyperparameters
+
+scripts/              # performance pipeline (precomputed embeddings + GPU aug + async H2D)
+  embedding_extract.py    # 6-rank Qwen3-Embedding-4B extractor → text_emb.mmap
+  run_extract.sh          # launcher for the 6× 5090 extraction job
+  gpu_transforms.py       # GPU-side RRC + HFlip + ColorJitter + Normalize
+  prefetcher.py           # PinnedPrefetcher (side stream + persistent pinned buffers)
 ```
 
 ## Setup
@@ -128,6 +134,24 @@ to learn real embedding separation before the temperature can sharpen the loss a
   Original CLIP uses a *linear* projection (no hidden layer); they argue
   non-linear projectors are co-adapted to self-supervised representation
   learning and don't help here. Worth A/B testing.
+
+## Performance pipeline (v6+ speedups)
+
+Profiling the v6 step revealed three stacked bottlenecks. Each one has its
+own GitHub issue with measurements + fix details:
+
+| # | Bottleneck (before) | Approach | Win |
+|---|---|---|---|
+| [#8](https://github.com/MokshitSama/clip-from-scratch-cc12m/issues/8) | Frozen text encoder fwd ran every step (~50 ms/step, ~40% of compute) | Extract once with **Qwen3-Embedding-4B** + flash-attn-2 → fp16 **sparse memmap** keyed by `int(stem)` | text fwd → **0 ms/step** at train time; one-time ~25 min on 6×5090 |
+| [#13](https://github.com/MokshitSama/clip-from-scratch-cc12m/issues/13) | albumentations CPU aug per sample → GPU stalled at 30-70% util | Move RandomResizedCrop + HFlip + ColorJitter + Normalize to GPU; RRC+flip fold into one affine matrix consumed by `F.grid_sample` | **~5.5 ms / B=256** on a 3090; CPU workers just decode + resize-to-256 |
+| [#14](https://github.com/MokshitSama/clip-from-scratch-cc12m/issues/14) | 50 MB/batch sync H2D blocked next forward | `PinnedPrefetcher`: side stream + persistent pinned host buffers; H2D for batch N+1 overlaps with compute on batch N | **~11% wall-clock** on a synthetic 50-batch bench (4.65 s → 4.12 s) |
+
+Real bugs caught while landing the above are tracked separately:
+[#9](https://github.com/MokshitSama/clip-from-scratch-cc12m/issues/9) (OOM on 3090 at bs=256),
+[#11](https://github.com/MokshitSama/clip-from-scratch-cc12m/issues/11) (concurrent memmap allocation race),
+[#15](https://github.com/MokshitSama/clip-from-scratch-cc12m/issues/15) (`non_blocking=True` is silently sync without a pinned source — the classic prefetcher gotcha).
+
+The training rewrite that actually consumes all three speedups (`train_precomp.py` — text tower removed, memmap row lookup at the index, `GPUTrainTransform`, `PinnedPrefetcher`) is in progress.
 
 ## Run log
 
