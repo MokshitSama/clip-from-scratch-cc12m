@@ -24,6 +24,7 @@ BATCH_SIZE     = 256
 NUM_WORKERS    = 8
 SHUFFLE_BUFFER = 4000
 SHARD_SHUFFLE  = 100             # window for wds shard-level shuffle
+
 def _decode_jpg(jpg_bytes: bytes) -> np.ndarray:
     """JPEG → uint8 HWC numpy, short-side = CROP_SIZE, then center-cropped square.
     Uses libjpeg draft mode for fast decode (1/2, 1/4 or 1/8 scale during decode)."""
@@ -50,7 +51,6 @@ def _decode_jpg(jpg_bytes: bytes) -> np.ndarray:
 
 
 def _preprocess(sample):
-    """(key_str, jpg_bytes) → (int sample_idx, uint8 HWC image)."""
     key, jpg = sample
     return int(key), _decode_jpg(jpg)
 
@@ -84,7 +84,7 @@ def build_loader(batch_size: int = BATCH_SIZE,
         .shuffle(shuffle_buffer)
         .to_tuple("__key__", "jpg")
         .map(_preprocess, handler=wds.warn_and_continue)
-        .batched(batch_size, collation_fn=_collate, partial=False)  # contrastive needs uniform B
+        .batched(batch_size, collation_fn=_collate, partial=False)        # contrastive needs uniform B
     )
     return wds.WebLoader(
         pipeline,
@@ -109,7 +109,7 @@ def build_val_loader(batch_size: int = 512,
         )
         .to_tuple("__key__", "jpg")
         .map(_preprocess, handler=wds.warn_and_continue)
-        .batched(batch_size, collation_fn=_collate, partial=True)  # keep final partial batch on val
+        .batched(batch_size, collation_fn=_collate, partial=True)         # keep final partial batch on val
     )
     return wds.WebLoader(
         pipeline,
@@ -131,7 +131,7 @@ if __name__ == "__main__":
     for i, (imgs, idx) in enumerate(loader):
         dt = time.time() - t0
         print(f"  batch {i}: imgs {imgs.shape} {imgs.dtype}  "
-              f"idx {idx.shape} {idx.dtype}  idx[:3]={idx[:3].tolist()}  ({dt:.2f}s)")
+            f"idx {idx.shape} {idx.dtype}  idx[:3]={idx[:3].tolist()}  ({dt:.2f}s)")
         if i >= 2:
             break
         t0 = time.time()
