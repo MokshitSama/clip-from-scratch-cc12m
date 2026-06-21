@@ -17,7 +17,41 @@ class Projector(nn.Module):
 
     def forward(self, x):
         return self.net(x)
+    
+class CLIPPrecompModel(nn.Module):
+    """Image backbone + image projector + text projector + learned scale.
 
+    Text tower is gone — text embeddings come from a precomputed memmap
+    (Qwen3-Embedding-4B, 2560-dim, already L2-normalized) keyed by
+    sample_idx. The text_projector maps that fp16 2560-dim vector into
+    the shared embed_dim (512 by default).
+    """
+    def __init__(self,
+                 image_backbone="tf_efficientnet_b1.aa_in1k",
+                 text_emb_dim=2560,
+                 embed_dim=512,
+                 proj_hidden_dim=1024):
+        super().__init__()
+        self.image_backbone  = timm.create_model(image_backbone, pretrained=True, num_classes=0)
+        self.image_projector = Projector(self.image_backbone.num_features, proj_hidden_dim, embed_dim)
+        self.text_projector  = Projector(text_emb_dim, proj_hidden_dim, embed_dim)
+        self.log_scale       = nn.Parameter(torch.tensor(0.0))
+
+    def encode_image(self, images):
+        return self.image_projector(self.image_backbone(images))
+    
+    def encode_text(self, text_emb):
+        return self.text_projector(text_emb.float())
+    
+    def forward(self, images, text_emb):
+        img = F.normalize(self.encode_image(images), dim=-1)
+        txt = F.normalize(self.encode_text(text_emb), dim=-1)
+        return img, txt, self.log_scale.exp().clamp(max=100.0)
+
+
+
+
+# Not be using but keeping for the sake of previous versions
 
 class CLIPModel(nn.Module):
     """Pretrained image backbone + pretrained-trainable text encoder + projectors + learned temperature.
@@ -69,30 +103,30 @@ class CLIPModel(nn.Module):
         return img_emb, txt_emb, logit_scale
 
 
-def clip_loss(img_emb, txt_emb, logit_scale):
-    """Symmetric InfoNCE over a single batch (no DDP gather)."""
-    logits = logit_scale * img_emb @ txt_emb.T
-    labels = torch.arange(img_emb.shape[0], device=img_emb.device)
-    return 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
-
-
 if __name__ == "__main__":
-    # Quick shape + loss sanity check on dummy tensors.
+    # Smoke test for CLIPPrecompModel: dummy images + a dummy 2560-dim text emb,
+    # verify shapes through the projectors + that the loss math wires up.
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = CLIPModel().to(device)
+    model = CLIPPrecompModel().to(device)
 
-    total = sum(p.numel() for p in model.parameters())
+    total     = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total params:     {total:>13,}")
-    print(f"Trainable params: {trainable:>13,}  ({100 * trainable / total:.1f}%)")
+    print(f"CLIPPrecompModel — Total params:     {total:>13,}")
+    print(f"CLIPPrecompModel — Trainable params: {trainable:>13,}  "
+          f"({100 * trainable / total:.1f}%)")
 
     B = 4
-    images = torch.randn(B, 3, 224, 224, device=device)
-    input_ids = torch.randint(0, 30000, (B, 64), device=device)
-    attn_mask = torch.ones(B, 64, dtype=torch.long, device=device)
+    images   = torch.randn(B, 3, 224, 224, device=device)
+    text_emb = F.normalize(torch.randn(B, 2560, device=device), dim=-1)   # mimic memmap row
 
-    img_emb, txt_emb, scale = model(images, input_ids, attn_mask)
-    loss = clip_loss(img_emb, txt_emb, scale)
+    img_emb, txt_emb, scale = model(images, text_emb)
+    print(f"img_emb {tuple(img_emb.shape)}  txt_emb {tuple(txt_emb.shape)}  "
+          f"scale {scale.item():.3f}")
 
-    print(f"img_emb {tuple(img_emb.shape)}  txt_emb {tuple(txt_emb.shape)}  scale {scale.item():.3f}")
-    print(f"loss = {loss.item():.4f}  (expected near log({B}) = {torch.log(torch.tensor(float(B))).item():.4f})")
+    # Simple symmetric InfoNCE (positives on the diagonal) — random embs should
+    # land near log(B) since chance accuracy is 1/B.
+    logits = scale * img_emb @ txt_emb.T
+    labels = torch.arange(B, device=device)
+    loss = 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
+    print(f"loss = {loss.item():.4f}  "
+          f"(random anchors should land near log({B}) = {torch.log(torch.tensor(float(B))).item():.4f})")

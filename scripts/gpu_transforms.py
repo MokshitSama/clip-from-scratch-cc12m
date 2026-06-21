@@ -104,3 +104,33 @@ class GPUTrainTransform(nn.Module):
         return x
 
 
+class GPUValTransform(nn.Module):
+    """Deterministic val-time preprocessing on GPU.
+
+    Input:  uint8 (B, H_in, W_in, 3) HWC on GPU.
+            CPU workers already center-crop to a square; H_in == W_in (typically 256).
+    Output: float (B, 3, image_size, image_size), ImageNet-normalized.
+
+    Just: permute → /255 → deterministic center-crop to image_size → normalize.
+    No augmentation, no randomness — eval needs to be reproducible.
+    """
+    def __init__(self, image_size: int = IMAGE_SIZE):
+        super().__init__()
+        self.image_size = image_size
+
+        mean = torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
+        std  = torch.tensor(IMAGENET_STD).view(1, 3, 1, 1)
+        self.register_buffer("mean", mean)
+        self.register_buffer("std",  std)
+
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: uint8 (B, H, W, 3)
+        x = x.permute(0, 3, 1, 2).contiguous().float() / 255.0   # (B, 3, H, W) in [0, 1]
+        _, _, H, W = x.shape
+        top  = (H - self.image_size) // 2
+        left = (W - self.image_size) // 2
+        x = x[:, :, top:top + self.image_size, left:left + self.image_size]
+        return (x - self.mean) / self.std
+
+
