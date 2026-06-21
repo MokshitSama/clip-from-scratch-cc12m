@@ -15,11 +15,26 @@ class PinnedPrefetcher:
         key = (tuple(shape), dtype)
         buf = self._host_bufs.get(key)
         if buf is None:
-            buf = torch.empty(shape, dtype=dtype, pin_memory=True)
+            try:
+                buf = torch.empty(shape, dtype=dtype, pin_memory=True)
+            except RuntimeError as e:
+                # Blackwell + CUDA 12.8 multi-rank pinning race: intermittently
+                # one rank's pin call collides with NCCL/driver activity and
+                # errors with "CUDA error: invalid argument". Fall back to an
+                # unpinned buffer for this rank; the .to(non_blocking=True)
+                # then silently degrades to sync (issue #15). Training works,
+                # we just lose the H2D overlap on the affected rank.
+                if "invalid argument" not in str(e):
+                    raise
+                buf = torch.empty(shape, dtype=dtype)
             self._host_bufs[key] = buf
         return buf
 
     def _to_gpu(self, batch):
+        # Allocation + host memcpy happen OUTSIDE any side-stream context
+        # (pinning host memory inside a non-default stream context errors
+        #  with "CUDA error: invalid argument" on Blackwell). Only the
+        # actual async H2D op needs to run on self.stream.
         out = []
         for item in batch:
             if isinstance(item, np.ndarray):
@@ -30,17 +45,17 @@ class PinnedPrefetcher:
             buf = self._get_pinned(src.shape, src.dtype) # persistent pinned tensor
             buf.copy_(src) # CPU memcpy: numpy → pinned
 
-            out.append(buf.to(self.device, non_blocking=True))
+            with torch.cuda.stream(self.stream):
+                out.append(buf.to(self.device, non_blocking=True))
         return tuple(out)
-    
+
     def _preload(self):
         try:
             cpu_batch = next(self._iter)
         except StopIteration:
             self._next = None
             return
-        with torch.cuda.stream(self.stream):
-            self._next = self._to_gpu(cpu_batch)
+        self._next = self._to_gpu(cpu_batch)
 
     def __iter__(self):
         self._iter = iter(self.loader)
