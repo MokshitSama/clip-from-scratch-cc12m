@@ -149,7 +149,99 @@ own GitHub issue with measurements + fix details:
 Worth-knowing gotcha caught while landing the above:
 [#15](https://github.com/MokshitSama/clip-from-scratch-cc12m/issues/15) — `non_blocking=True` is silently sync without a pinned source. The classic prefetcher trap; a side-stream copy that *looks* async will silently fall back to a default-stream sync copy if the host tensor isn't pinned.
 
-The training rewrite that actually consumes all three speedups (`train_precomp.py` — text tower removed, memmap row lookup at the index, `GPUTrainTransform`, `PinnedPrefetcher`) is in progress.
+The training rewrite that actually consumes all three speedups is `train_precomp.py` — text tower removed, memmap row lookup at the index, `GPUTrainTransform`, `PinnedPrefetcher`.
+
+## v6 vs v7 — what the pipeline actually bought us
+
+v6 and v7 ran the exact same 20-epoch schedule over the same train shards
+on the same 6×5090 box. The only differences: v7's text tower is gone
+(precomputed Qwen3-Embedding-4B embeddings in a /dev/shm memmap), images
+are augmented on the GPU, and the prefetcher overlaps H2D with compute.
+
+### Wall-clock
+
+| | v6 | v7 | Δ |
+|---|---|---|---|
+| Throughput | ~2,800 samples/s | ~5,650 samples/s | **2.0×** |
+| Total wall-clock (20 epochs) | 22.4 h | 12.9 h | **−9.5 h (−42%)** |
+| Per-step time (B=1536 global) | ~540 ms | ~270 ms | **−270 ms / step** |
+
+Where the 270 ms went, roughly:
+- Text encoder forward (BGE base, B=256): **~50 ms** → 0 (memmap lookup)
+- CPU augmentation (albumentations per sample, 8 workers): **~150 ms wait** → ~5 ms GPU (no wait)
+- Sync H2D of (B, 256, 256, 3) uint8: **~10–15 ms** → hidden behind compute
+- Misc (better worker overlap, less Python overhead on the worker side): **~60 ms**
+
+### Held-out R@1
+
+This is where the trade-off bites.
+
+| | v6 | v7 |
+|---|---|---|
+| Architecture | Image bb + **trainable** BGE-base text | Image bb + **frozen** Qwen3-Embedding-4B (lookup) |
+| Trainable params | 118.6 M | 11.5 M |
+| 1M-pair val avg R@1 | **4.528 %** | **2.466 %** |
+| 5000-pair val i2t R@1 | **45.12 %** | **34.12 %** |
+| 5000-pair val t2i R@1 | **45.36 %** | **35.18 %** |
+
+v7's pipeline runs ~2× faster but **its retrieval quality is worse**.
+Reason: freezing the text encoder removes ~107 M of joint-adaptation
+capacity. A much stronger frozen text encoder (Qwen3-Embedding-4B,
+2560-dim, retrieval-tuned at LLM scale) doesn't make up for losing the
+ability to bend the text representation toward the visual distribution.
+
+The right framing of v7 isn't "v7 is better than v6." It's **"v7 is the
+infra"** — we now have a scalable, throughput-friendly chassis. The
+next step is to put *the right model* on top of it.
+
+## Where we stand vs OpenAI CLIP & OpenCLIP — on the same 5000-pair eval
+
+| Model | Params | i2t R@1 | t2i R@1 | mean rank | Notes |
+|---|---:|---:|---:|---:|---|
+| **v7 (ours)** | 11.5 M | 34.12 % | 35.18 % | 36.5 | frozen text, cc12m, 20 epochs |
+| **v6 (ours)** | 118.6 M | 45.12 % | 45.36 % | 32.4 | trainable text, cc12m, 20 epochs |
+| OpenAI CLIP ViT-B/16 | 149.6 M | 60.66 % | 59.10 % | 23.5 | trainable text, **WIT-400M** |
+| OpenAI CLIP ViT-L/14 | 427.6 M | 67.74 % | 66.82 % | 19.1 | trainable text, **WIT-400M**, larger image bb |
+| OpenCLIP RN50 cc12m | 102.0 M | 84.58 % | 84.66 % | 1.6 | trainable text, **cc12m** (shard 0020 partially leaked) |
+
+### What this says about scaling
+
+- **More data is the biggest lever.** OpenAI CLIP B/16 has similar trainable
+  capacity to v6 (~120–150 M) but was trained on ~40× more data (WIT-400M
+  vs cc12m's 11 M) and clears v6 by **+15 R@1**. cc12m caption quality
+  is much worse than WIT, so the gap is partly data scale and partly
+  data quality.
+- **Joint text training is also a big lever.** OpenCLIP RN50 on cc12m
+  destroys both of us with **+39 R@1** vs v6 at fewer parameters. They
+  trained the whole stack and ran for a long time. Their advantage is
+  inflated some by shard-0020 leakage into their training set, but most
+  of it is real.
+- **What if we trained 5× longer on cc12m?** v7's loss + R@1 slope was
+  still decreasing at epoch 19 (the cosine schedule was draining the
+  LR, not the gradient signal). A longer schedule probably gets us
+  another 1–2 R@1, but won't close the 15-point gap to CLIP B/16. That
+  gap is the data.
+
+### Would we get CLIP-quality results with comparable data?
+
+Honest answer: **the recipe matters more than we hoped, and the data
+matters more than the recipe.** With WIT-400M + a properly jointly-trained
+text encoder + a ViT-class image bb, the v7-pipeline numbers would land
+in CLIP B/16's neighborhood (~60 % R@1 on this 5000-pair eval). With
+cc12m only — even with infinite compute — we plateau around
+mid-50s % R@1 on the same eval, because cc12m captions just aren't as
+clean or as broad as WIT.
+
+The cleanest near-term direction is **SigLIP-style training**:
+- Keep the text frozen (so v7's 2× pipeline speedup stays).
+- Drop the image batch but pull *many* random text-embedding negatives
+  per step (we already have them all in /dev/shm).
+- Use sigmoid loss instead of softmax InfoNCE — it tolerates
+  arbitrary numbers of negatives without needing a square K×K matrix.
+
+This should give us many more useful gradient updates per wall-clock
+second on the same hardware, and recover some of the quality v7 lost
+by freezing text. Tracked separately.
 
 ## Run log
 
@@ -165,7 +257,9 @@ a 1M val is statistically more reliable but also a strictly harder problem.
 | v2 | ViT-B/16 from scratch, 5 epochs, lr 5e-4, log_scale init 0.0 | lower LR; flatter softmax init | scale climbs slowly, loss starts dropping post-warmup | scale healthy (3.99 at kill), loss 7.13, but held-out R@1 only 0.05% at 0.5 ep — killed early to swap backbone | no real progress |
 | v3 | ResNet-50 from scratch, 5 epochs | swap backbone ViT → ResNet-50 (random init) | conv inductive bias learns faster than ViT in this data regime | **R@1 = 4.03%** at end of 5 epochs | +4.03 |
 | v4 | ResNet-50 (pretrained ImageNet), 20 epochs | longer schedule; pretrained warm-start instead of random init | 20 epochs + pretrained should land ~8-15% | **R@1 = 6.70%** at epoch ~10.5 (run killed ~52% in, so this is a partial result) | +2.67 |
-| v5 | EfficientNet B1 (pretrained) + BGE-base text encoder, 1M val, 20 epochs, eval 1x/epoch | replaced ResNet-50 → EfficientNet B1 (6.5M vs 23.5M); BERT-base → BGE-base-en-v1.5 (same params, retrieval-trained); val 5k → 1M; eval 4x → 1x per epoch | smaller image bb might cap representation; BGE should noticeably improve text side; 1M val is more reliable but harder than 5k → R@1 numbers may look *lower* even if model is better | _to be filled in_ | _to be filled in_ |
+| v5 | EfficientNet B1 (pretrained) + BGE-base text encoder, 1M val, 20 epochs, eval 1x/epoch | replaced ResNet-50 → EfficientNet B1 (6.5M vs 23.5M); BERT-base → BGE-base-en-v1.5 (same params, retrieval-trained); val 5k → 1M; eval 4x → 1x per epoch | smaller image bb might cap representation; BGE should noticeably improve text side; 1M val is more reliable but harder than 5k → R@1 numbers may look *lower* even if model is better | _early run; superseded by v6_ | _n/a_ |
+| v6 | EfficientNet B1 + **trainable** BGE-base text encoder, 20 epochs, eval 4x/epoch, 1M val | unfroze the text encoder so both backbones train jointly; otherwise same as v5 | trainable text should give text side flexibility to align to images → bigger R@1 lift than v5 | **R@1 = 4.528%** at epoch 19 (`ckpt_step00123196.pt`); 22.4 h on 6×5090 | best to date |
+| v7 | EfficientNet B1 + **precomputed** Qwen3-Embedding-4B text (frozen), 20 epochs, eval 1x/epoch, 1M val | text encoder forward removed entirely (memmap row lookup); on-GPU augmentation; pinned-buffer async H2D; tested SigLIP-style infrastructure | with much stronger frozen text emb + same image bb, expect R@1 comparable or slightly better than v6; pipeline should be ~2× faster | **R@1 = 2.466%** (lower); 12.87 h on 6×5090 (1.74× faster wall-clock). Quality regressed because frozen text can't bend toward visual distribution; pipeline win is real | −2.06 vs v6 |
 
 ## Notes on choosing each piece
 
