@@ -1,34 +1,31 @@
-"""Benchmark v6 against OpenAI CLIP and OpenCLIP cc12m.
+"""Benchmark v6 + v7 against OpenAI CLIP and OpenCLIP cc12m.
 
 Uses the cached 5000-pair set from cc12m shard 0020. All models score on
 the SAME 5000 images / 5000 captions — only the preprocessing differs
-(each model's own normalization + tokenizer).
+(each model's own normalization + tokenizer / text encoder).
 
-Caveats worth knowing when reading the results:
+v6 has a trainable BGE-base text encoder baked in. v7 (precomp) loads
+text embeddings on demand by re-encoding the val captions through the
+Qwen3-Embedding-4B that produced the training table — that takes ~2 min
+of Qwen3 load + encode, then Qwen3 is freed before any other model is
+loaded.
 
-- Shard 0020 is in our held-out set (we train on shards 0000-0019 +
-  0220-2175). For OpenAI CLIP it's never seen. For OpenCLIP cc12m it
-  COULD be in training data, since they used all of cc12m. Their
-  advantage there is real but bounded — cc12m has 12M pairs, the
-  chance of having memorized a specific (image, caption) is low.
-- All three reference models are ViT / RN, not EfficientNet B1. Different
-  architectures and parameter counts. We're comparing recipes more than
-  fair apples-to-apples.
-- 5000 candidates is the size used in the CLIP paper's COCO eval; R@1 at
-  this scale is the standard metric people report.
+Caveats worth knowing:
+- Shard 0020 is in our held-out set. For OpenAI CLIP, unseen. For
+  OpenCLIP cc12m it could be in their training data (they used all of
+  cc12m). The advantage there is real but bounded.
+- Different architectures + param counts. We're comparing recipes more
+  than apples-to-apples.
+- 5000 candidates is the CLIP-paper standard for COCO-style eval.
 
 Run with:
-    CUDA_VISIBLE_DEVICES=4 python benchmark.py
+    CUDA_VISIBLE_DEVICES=4 python benchmark.py   # 3090
+    CUDA_VISIBLE_DEVICES=0 python benchmark.py   # a 5090 (faster)
 """
 import os
 
-# IMPORTANT: pin to the idle 3090 BEFORE torch imports / CUDA inits, so we
-# don't fight v6 training for VRAM on a 5090.
-# CUDA_DEVICE_ORDER=PCI_BUS_ID forces CUDA to match nvidia-smi's index
-# order (otherwise CUDA picks FASTEST_FIRST and the 3090 ends up at a
-# different index than what nvidia-smi shows).
-os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
-os.environ["CUDA_VISIBLE_DEVICES"] = os.environ.get("CUDA_VISIBLE_DEVICES", "4")
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "4")
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 
 import sys
@@ -36,22 +33,20 @@ import time
 from pathlib import Path
 
 import torch
-
-if torch.cuda.is_available():
-    name = torch.cuda.get_device_name(0)
-    total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    print(f"Using device: {name}  ({total_gb:.1f} GB)")
-    assert total_gb < 30, f"Expected 24 GB 3090, got {total_gb:.1f} GB — wrong GPU. Set CUDA_VISIBLE_DEVICES=4 manually."
 import torch.nn.functional as F
 import open_clip
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from model import CLIPModel
+from model import CLIPModel, CLIPPrecompModel
 
 
 DEVICE   = "cuda"
 VAL_PATH = Path(__file__).parent / "val_set_cc12m_0020_5000.pt"
-CKPT_DIR = Path(__file__).parent / "runs" / "v6" / "checkpoints"
+V6_DIR   = Path(__file__).parent / "runs" / "v6" / "checkpoints"
+V7_DIR   = Path(__file__).parent / "runs" / "v7" / "checkpoints"
+QWEN_MODEL = "Qwen/Qwen3-Embedding-4B"
+QWEN_MAX_LEN = 128
+
 
 # Our preprocessing used ImageNet stats; CLIP uses its own.
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
@@ -68,17 +63,16 @@ def renormalize_imagenet_to_clip(imgs: torch.Tensor) -> torch.Tensor:
     return (raw - m_c) / s_c                    # forward with CLIP stats
 
 
-def find_latest_ckpt() -> Path:
-    """Pick the highest-step checkpoint currently on disk."""
-    ckpts = sorted(CKPT_DIR.glob("ckpt_step*.pt"))
+def find_latest_ckpt(ckpt_dir: Path) -> Path:
+    ckpts = sorted(ckpt_dir.glob("ckpt_step*.pt"))
     if not ckpts:
-        raise RuntimeError(f"No checkpoints in {CKPT_DIR}")
+        raise RuntimeError(f"No checkpoints in {ckpt_dir}")
     return ckpts[-1]
 
 
 @torch.no_grad()
-def embed_ours(model, val, bs=64):
-    """Embed with our v6 CLIPModel (ImageNet preprocessing, BGE tokens)."""
+def embed_v6(model, val, bs=64):
+    """v6: CLIPModel forward with ImageNet-normalized images + BGE tokens."""
     images    = val["images"].to(DEVICE)
     input_ids = val["input_ids"].to(DEVICE)
     mask      = val["attention_mask"].to(DEVICE)
@@ -93,14 +87,23 @@ def embed_ours(model, val, bs=64):
 
 
 @torch.no_grad()
-def embed_openclip(model, tokenizer, val, bs=32, max_text_len=77):
-    """Embed with an open_clip model.
+def embed_v7(model, val, text_emb_qwen, bs=64):
+    """v7: CLIPPrecompModel forward with ImageNet-normalized images +
+    precomputed Qwen3-Embedding-4B text embeddings (2560-dim)."""
+    images = val["images"].to(DEVICE)
+    img_out, txt_out = [], []
+    for i in range(0, images.shape[0], bs):
+        with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+            ie, te, _ = model(images[i:i+bs], text_emb_qwen[i:i+bs])
+        img_out.append(ie.float())
+        txt_out.append(te.float())
+    return torch.cat(img_out), torch.cat(txt_out)
 
-    Re-normalize stored ImageNet-normalized tensors to CLIP stats.
-    Re-tokenize raw captions with each model's BPE tokenizer.
-    """
+
+@torch.no_grad()
+def embed_openclip(model, tokenizer, val, bs=32, max_text_len=77):
+    """OpenCLIP path: re-normalize images to CLIP stats, re-tokenize captions."""
     imgs = renormalize_imagenet_to_clip(val["images"].to(DEVICE))
-    # open_clip tokenizers truncate to context_length automatically.
     text_tokens = tokenizer(val["captions"]).to(DEVICE)
     if text_tokens.shape[1] > max_text_len:
         text_tokens = text_tokens[:, :max_text_len]
@@ -115,8 +118,30 @@ def embed_openclip(model, tokenizer, val, bs=32, max_text_len=77):
     return torch.cat(img_out), torch.cat(txt_out)
 
 
+def encode_captions_qwen(captions):
+    """Run Qwen3-Embedding-4B on the val captions to produce 2560-dim
+    fp32 normalized text embeddings. Frees Qwen3 before returning."""
+    from sentence_transformers import SentenceTransformer
+    print(f"  loading {QWEN_MODEL} (sdpa)...")
+    qwen = SentenceTransformer(
+        QWEN_MODEL, device=DEVICE,
+        model_kwargs={"torch_dtype": torch.bfloat16,
+                      "attn_implementation": "sdpa"},
+    )
+    qwen.max_seq_length = QWEN_MAX_LEN
+    t0 = time.time()
+    text_emb = qwen.encode(
+        captions, batch_size=64, normalize_embeddings=True,
+        convert_to_numpy=True, show_progress_bar=False,
+    )
+    print(f"  encoded {len(captions)} captions in {time.time()-t0:.1f}s, "
+          f"shape={text_emb.shape}")
+    del qwen
+    torch.cuda.empty_cache()
+    return torch.from_numpy(text_emb).to(DEVICE)
+
+
 def retrieval_metrics(img_emb, txt_emb):
-    """Standard R@{1,5,10} + mean_rank for both directions on an NxN sim matrix."""
     n = img_emb.shape[0]
     labels = torch.arange(n, device=img_emb.device)
     sim = img_emb @ txt_emb.T
@@ -132,6 +157,11 @@ def retrieval_metrics(img_emb, txt_emb):
 
 
 def main():
+    if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+        total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"Using device: {name}  ({total_gb:.1f} GB)\n")
+
     print(f"Loading val set: {VAL_PATH.name}")
     val = torch.load(VAL_PATH, weights_only=False)
     n = val["images"].shape[0]
@@ -140,24 +170,43 @@ def main():
     results = {}
     sizes   = {}
 
-    # --- Our v6 ---
-    ckpt_path = find_latest_ckpt()
-    print(f"Loading our v6 ({ckpt_path.name})...")
-    our = CLIPModel().to(DEVICE)
-    ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
-    missing, unexpected = our.load_state_dict(ckpt["model_state"], strict=False)
-    print(f"  step: {ckpt.get('step')}  missing: {len(missing)}  unexpected: {len(unexpected)}")
-    our.eval()
+    # --- v7 first: encode captions through Qwen3, then run v7 forward, free both ---
+    print("Encoding val captions through Qwen3-Embedding-4B (for v7)...")
+    text_emb_qwen = encode_captions_qwen(val["captions"])
 
-    n_params_v6 = sum(p.numel() for p in our.parameters())
-    sizes["v6 (ours)"] = n_params_v6
+    v7_ckpt = find_latest_ckpt(V7_DIR)
+    print(f"\nLoading v7 ({v7_ckpt.name})...")
+    v7 = CLIPPrecompModel().to(DEVICE)
+    ckpt = torch.load(v7_ckpt, map_location=DEVICE, weights_only=False)
+    missing, unexpected = v7.load_state_dict(ckpt["model_state"], strict=False)
+    print(f"  step: {ckpt.get('step')}  missing: {len(missing)}  unexpected: {len(unexpected)}")
+    v7.eval()
+    sizes["v7 (ours)"] = sum(p.numel() for p in v7.parameters())
+
+    print("Embedding with v7...")
+    t0 = time.time()
+    img, txt = embed_v7(v7, val, text_emb_qwen)
+    print(f"  done in {time.time()-t0:.1f}s")
+    results["v7 (ours)"] = retrieval_metrics(img, txt)
+    del v7, img, txt, text_emb_qwen
+    torch.cuda.empty_cache()
+
+    # --- v6 ---
+    v6_ckpt = find_latest_ckpt(V6_DIR)
+    print(f"\nLoading v6 ({v6_ckpt.name})...")
+    v6 = CLIPModel().to(DEVICE)
+    ckpt = torch.load(v6_ckpt, map_location=DEVICE, weights_only=False)
+    missing, unexpected = v6.load_state_dict(ckpt["model_state"], strict=False)
+    print(f"  step: {ckpt.get('step')}  missing: {len(missing)}  unexpected: {len(unexpected)}")
+    v6.eval()
+    sizes["v6 (ours)"] = sum(p.numel() for p in v6.parameters())
 
     print("Embedding with v6...")
     t0 = time.time()
-    img, txt = embed_ours(our, val)
-    print(f"  done in {time.time() - t0:.1f}s")
+    img, txt = embed_v6(v6, val)
+    print(f"  done in {time.time()-t0:.1f}s")
     results["v6 (ours)"] = retrieval_metrics(img, txt)
-    del our, img, txt
+    del v6, img, txt
     torch.cuda.empty_cache()
 
     # --- Reference models ---
@@ -171,13 +220,12 @@ def main():
         model, _, _ = open_clip.create_model_and_transforms(arch, pretrained=pretrained)
         tokenizer = open_clip.get_tokenizer(arch)
         model = model.to(DEVICE).eval()
-
         sizes[label] = sum(p.numel() for p in model.parameters())
 
         print(f"Embedding with {label}...")
         t0 = time.time()
         img, txt = embed_openclip(model, tokenizer, val)
-        print(f"  done in {time.time() - t0:.1f}s")
+        print(f"  done in {time.time()-t0:.1f}s")
         results[label] = retrieval_metrics(img, txt)
         del model, img, txt
         torch.cuda.empty_cache()
