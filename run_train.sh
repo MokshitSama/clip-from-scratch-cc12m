@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")"
 
 if [[ -z "${VERSION:-}" ]]; then
     echo "ERROR: VERSION env var is required (e.g. VERSION=7 ./scripts/run_train.sh)" >&2
