@@ -20,7 +20,9 @@ TRAIN_SHARDS = (
 VAL_SHARDS = list(braceexpand("/mnt/md0/cc12m/cc12m-train-{0020..0219}.tar"))
 
 CROP_SIZE     = 256
-BATCH_SIZE     = 256
+BATCH_SIZE     = 64        # v8 SigLIP: smaller image batch (image fwd is the bottleneck);
+                           # contrastive difficulty comes from `n_negs` random text rows
+                           # pulled from /dev/shm each step (see train_utils.train_steps).
 NUM_WORKERS    = 8
 SHUFFLE_BUFFER = 4000
 SHARD_SHUFFLE  = 100             # window for wds shard-level shuffle
