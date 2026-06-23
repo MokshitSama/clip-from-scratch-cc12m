@@ -36,18 +36,192 @@ text  (≤64 tok) -> BGE-base-en-v1.5 (pretrained, frozen)    ->  768 -> MLP -> 
 ## Files
 
 ```
-model.py              # CLIPModel + clip_loss + Projector
-build_loader.py       # WebDataset streaming loader over cc12m shards
-build_val_set.py      # one-shot script to materialize the held-out val tensors
-train.py              # multi-GPU training loop with gathered-features contrastive loss
-evaluate.py           # eval R@{1,5,10} + mean rank on a checkpoint
-config.yaml           # all tunable hyperparameters
+train_precomp.py      # main training entrypoint (precomp pipeline). Builds loader +
+                      # prefetcher + transforms + model + optimizer, runs the
+                      # eval-interval loop calling train_steps + validate.
+train_utils.py        # train_steps inner loop, lr_schedule_factor, gather_features,
+                      # clip_loss_gathered, save_ckpt, manage_ckpts.
+eval_utils.py         # validate (1M-pair pass) + streaming_metrics (R@k + mean rank).
+model.py              # CLIPPrecompModel (image bb + projectors + log_scale) + Projector.
+                      # CLIPModel (v6 dual-tower) kept for benchmark.py / evaluate.py.
+dataset.py            # WebDataset streaming loader. JPEG decode + 256-crop → uint8 HWC
+                      # + sample_idx (the cc12m stem parsed as int, used as memmap row).
+benchmark.py          # v6 + v7 vs OpenAI CLIP / OpenCLIP cc12m on the 5000-pair set.
+evaluate.py           # R@{1,5,10} on a single v6 checkpoint (legacy, used by v6 ckpts).
+run_train.sh          # launcher: sets CUDA_DEVICE_ORDER=PCI_BUS_ID and the 5090 GPU
+                      # mask, then accelerate launch train_precomp.py.
+config.yaml           # all tunable hyperparameters.
 
-scripts/              # performance pipeline (precomputed embeddings + GPU aug + async H2D)
-  embedding_extract.py    # 6-rank Qwen3-Embedding-4B extractor → text_emb.mmap
-  run_extract.sh          # launcher for the 6× 5090 extraction job
-  gpu_transforms.py       # GPU-side RRC + HFlip + ColorJitter + Normalize
-  prefetcher.py           # PinnedPrefetcher (side stream + persistent pinned buffers)
+scripts/              # reusable infrastructure (used by training and one-time jobs)
+  embedding_extract.py    # 6-rank Qwen3-Embedding-4B extractor → text_emb.mmap. One-time.
+  run_extract.sh          # 6× 5090 extractor launcher. One-time.
+  embedding_lookup.py     # load_embedding_table: stage memmap from disk → /dev/shm on
+                          # rank 0, barrier, all ranks mmap from shm.
+  gpu_transforms.py       # GPUTrainTransform (RRC+flip+jitter+normalize via grid_sample)
+                          # and GPUValTransform (deterministic resize+normalize).
+  prefetcher.py           # PinnedPrefetcher (side stream + persistent pinned buffers
+                          # for true async H2D copies overlapping with model compute).
+```
+
+## Code map (flowcharts)
+
+### 1. Module dependencies — what reads what
+
+```mermaid
+graph TB
+    classDef entry fill:#fef3c7,stroke:#d97706,color:#000;
+    classDef helper fill:#dbeafe,stroke:#2563eb,color:#000;
+    classDef datamodel fill:#dcfce7,stroke:#16a34a,color:#000;
+    classDef infra fill:#fce7f3,stroke:#db2777,color:#000;
+    classDef onetime fill:#e9d5ff,stroke:#9333ea,color:#000;
+    classDef artifact fill:#f3f4f6,stroke:#6b7280,color:#000;
+
+    RT["run_train.sh<br/>(env hygiene + launcher)"]:::entry
+    TP["train_precomp.py<br/>(main loop)"]:::entry
+
+    TU["train_utils.py<br/>train_steps · lr_schedule<br/>gather · clip_loss · ckpt mgmt"]:::helper
+    EU["eval_utils.py<br/>validate · streaming_metrics"]:::helper
+
+    DS["dataset.py<br/>WebDataset loader"]:::datamodel
+    MD["model.py<br/>CLIPPrecompModel · Projector"]:::datamodel
+    CFG["config.yaml"]:::datamodel
+
+    GT["scripts/gpu_transforms.py<br/>GPUTrainTransform · GPUValTransform"]:::infra
+    PF["scripts/prefetcher.py<br/>PinnedPrefetcher"]:::infra
+    EL["scripts/embedding_lookup.py<br/>load_embedding_table"]:::infra
+
+    EE["scripts/embedding_extract.py<br/>6-rank Qwen3 extractor"]:::onetime
+    RE["scripts/run_extract.sh"]:::onetime
+    MM["/dev/shm/text_emb.mmap<br/>(12.5M × 2560 fp16)"]:::artifact
+
+    BM["benchmark.py<br/>v6 + v7 vs reference models"]:::onetime
+
+    RT --> TP
+    TP --> CFG
+    TP --> DS
+    TP --> MD
+    TP --> TU
+    TP --> EU
+    TP --> GT
+    TP --> PF
+    TP --> EL
+    TU --> MD
+    EU --> MD
+
+    RE --> EE
+    EE -.writes once.-> MM
+    EL -.mmaps.-> MM
+
+    BM --> MD
+```
+
+### 2. `train_precomp.py` startup + main loop
+
+```mermaid
+flowchart TD
+    classDef rank0 fill:#fef3c7,stroke:#d97706,color:#000;
+    classDef allranks fill:#dbeafe,stroke:#2563eb,color:#000;
+    classDef barrier fill:#fce7f3,stroke:#db2777,color:#000;
+
+    Start([VERSION=N ./run_train.sh]):::allranks
+    Env["export CUDA_DEVICE_ORDER=PCI_BUS_ID<br/>export CUDA_VISIBLE_DEVICES=0,1,2,3,5,6"]:::allranks
+    AL["accelerate launch --num_processes 6 train_precomp.py"]:::allranks
+    Acc["Accelerator() — NCCL init,<br/>device pinning per rank"]:::allranks
+
+    Wipe{{"rank 0:<br/>runs/vN/ exists?"}}:::rank0
+    Del["rank 0: shutil.rmtree(runs/vN/)"]:::rank0
+    Bar1["wait_for_everyone"]:::barrier
+
+    Build["all ranks: build_loader + PinnedPrefetcher<br/>+ GPUTrainTransform + GPUValTransform"]:::allranks
+    Stage["load_embedding_table:<br/>rank 0 stages /mnt → /dev/shm if missing"]:::rank0
+    Bar2["wait_for_everyone"]:::barrier
+    Mmap["all ranks: np.memmap from /dev/shm"]:::allranks
+
+    Model["build CLIPPrecompModel + 4-group AdamW"]:::allranks
+    Prep["accelerator.prepare(model, optimizer)"]:::allranks
+
+    Loop{{"step < total_steps?"}}:::allranks
+    Train["train_steps(n=eval_every)<br/>→ updates global step + prefetcher_iter"]:::allranks
+    Bar3["wait_for_everyone"]:::barrier
+    Eval["rank 0: build val loader, save ckpt,<br/>validate, manage_ckpts"]:::rank0
+    Bar4["wait_for_everyone"]:::barrier
+    Done([Training done — print best avg R@1]):::allranks
+
+    Start --> Env --> AL --> Acc --> Wipe
+    Wipe -- yes --> Del --> Bar1
+    Wipe -- no --> Bar1
+    Bar1 --> Build --> Stage --> Bar2 --> Mmap --> Model --> Prep --> Loop
+    Loop -- yes --> Train --> Bar3 --> Eval --> Bar4 --> Loop
+    Loop -- no --> Done
+```
+
+### 3. Per-step data flow (inside `train_steps`)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Disk as cc12m .tars
+    participant W as CPU workers (×8)
+    participant PF as PinnedPrefetcher
+    participant Aug as GPUTrainTransform
+    participant MM as /dev/shm<br/>text_emb.mmap
+    participant Mdl as CLIPPrecompModel
+    participant DDP as DDP all-reduce
+    participant Opt as AdamW
+
+    par data side
+        Disk->>W: read JPEG bytes
+        W->>W: decode (libjpeg draft) + resize 256 + center-crop
+        W->>PF: numpy (uint8 HWC, sample_idx)
+        PF->>PF: copy into persistent pinned host buffer
+        PF-->>Aug: async H2D on side stream<br/>(overlaps with prior step compute)
+    and compute side (prior step)
+        Mdl->>Opt: backward + step (still running)
+    end
+    Note over Aug,Opt: wait_stream fence — default stream waits for H2D
+
+    Aug->>Aug: RRC + HFlip + ColorJitter + Normalize
+    Aug->>Mdl: (B, 3, 224, 224) float
+    MM-->>Mdl: text_table[sample_idx] → (B, 2560) fp16
+    Mdl->>Mdl: image_backbone + image_projector + L2 norm
+    Mdl->>Mdl: text_projector + L2 norm
+    Mdl->>DDP: all_gather (img_emb, txt_emb) across ranks
+    DDP-->>Mdl: global tensors of size (world_size · B, embed_dim)
+    Mdl->>Mdl: clip_loss_gathered<br/>(symmetric InfoNCE on global batch)
+    Mdl->>Opt: backward + grad clip
+    Opt->>Mdl: parameter update
+```
+
+### 4. One-time embedding extraction (independent setup)
+
+```mermaid
+flowchart LR
+    classDef input fill:#fef3c7,stroke:#d97706,color:#000;
+    classDef gpu fill:#dbeafe,stroke:#2563eb,color:#000;
+    classDef artifact fill:#dcfce7,stroke:#16a34a,color:#000;
+
+    T["cc12m<br/>2176 .tar files<br/>~11 M samples"]:::input
+    L["run_extract.sh<br/>CUDA_DEVICE_ORDER=PCI_BUS_ID<br/>GPUS=(0 1 2 3 5 6)"]:::input
+
+    R0["GPU 0 · 363 shards"]:::gpu
+    R1["GPU 1 · 363 shards"]:::gpu
+    R2["GPU 2 · 363 shards"]:::gpu
+    R3["GPU 3 · 363 shards"]:::gpu
+    R5["GPU 5 · 363 shards"]:::gpu
+    R6["GPU 6 · 363 shards"]:::gpu
+
+    Q["Qwen3-Embedding-4B<br/>+ flash-attention-2<br/>last-token pool<br/>L2 normalize → fp16"]:::gpu
+
+    MM["text_emb.mmap<br/>sparse fp16<br/>12.5M × 2560 = 57 GB on disk"]:::artifact
+    DM["done/shard_NNNN<br/>per-shard markers<br/>(idempotent / resumable)"]:::artifact
+    META["meta.json<br/>{model, dim, max_rows, dtype, ...}"]:::artifact
+
+    T --> L
+    L --> R0 & R1 & R2 & R3 & R5 & R6
+    R0 & R1 & R2 & R3 & R5 & R6 --> Q
+    Q --> MM
+    Q --> DM
+    Q --> META
 ```
 
 ## Setup
