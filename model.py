@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import timm
+import math
 from transformers import AutoModel
 
 
@@ -35,7 +36,14 @@ class CLIPPrecompModel(nn.Module):
         self.image_backbone  = timm.create_model(image_backbone, pretrained=True, num_classes=0)
         self.image_projector = Projector(self.image_backbone.num_features, proj_hidden_dim, embed_dim)
         self.text_projector  = Projector(text_emb_dim, proj_hidden_dim, embed_dim)
-        self.log_scale       = nn.Parameter(torch.tensor(0.0))
+        
+        #before siglip
+        #self.log_scale       = nn.Parameter(torch.tensor(0.0))
+
+        # After
+        self.t_prime = nn.Parameter(torch.tensor(math.log(10.0)))
+        self.b = nn.Parameter(torch.tensor(-10.0))
+
 
     def encode_image(self, images):
         return self.image_projector(self.image_backbone(images))
@@ -46,7 +54,7 @@ class CLIPPrecompModel(nn.Module):
     def forward(self, images, text_emb):
         img = F.normalize(self.encode_image(images), dim=-1)
         txt = F.normalize(self.encode_text(text_emb), dim=-1)
-        return img, txt, self.log_scale.exp().clamp(max=100.0)
+        return img, txt, self.t_prime.exp(), self.b
 
 
 
@@ -119,14 +127,15 @@ if __name__ == "__main__":
     images   = torch.randn(B, 3, 224, 224, device=device)
     text_emb = F.normalize(torch.randn(B, 2560, device=device), dim=-1)   # mimic memmap row
 
-    img_emb, txt_emb, scale = model(images, text_emb)
+    img_emb, txt_emb, t, b = model(images, text_emb)
     print(f"img_emb {tuple(img_emb.shape)}  txt_emb {tuple(txt_emb.shape)}  "
-          f"scale {scale.item():.3f}")
+          f"t={t.item():.3f}  b={b.item():.3f}")
 
     # Simple symmetric InfoNCE (positives on the diagonal) — random embs should
     # land near log(B) since chance accuracy is 1/B.
-    logits = scale * img_emb @ txt_emb.T
-    labels = torch.arange(B, device=device)
-    loss = 0.5 * (F.cross_entropy(logits, labels) + F.cross_entropy(logits.T, labels))
-    print(f"loss = {loss.item():.4f}  "
-          f"(random anchors should land near log({B}) = {torch.log(torch.tensor(float(B))).item():.4f})")
+    logits = t * (img_emb @ txt_emb.T )+ b
+    labels = 2 * torch.eye(B, device=device) - 1
+    loss = -F.logsigmoid(labels * labels).sum() / B
+    print(f"loss = {loss.item():.4f}  (at init with random embs, loss ≈ log(1 + e^10) ≈ "
+          f"{math.log(1 + math.exp(10.0)):.4f} per positive, near-zero per negative — "
+          f"per-anchor sum dominated by positives so loss ≈ {math.log(1 + math.exp(10.0)):.2f})")

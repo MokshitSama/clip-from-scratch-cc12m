@@ -72,8 +72,11 @@ def validate(*, model, val_loader, gpu_val_transform, text_table,
             # text comes from the memmap, keyed by sample_idx
             text_emb_np = text_table[idx.numpy()]               # (B, 2560) fp16
             text_emb    = torch.from_numpy(text_emb_np).to(device, non_blocking=True)
-
-            img_emb, txt_emb, _ = model(imgs, text_emb)
+            #before
+            #img_emb, txt_emb, _ = model(imgs, text_emb)
+            
+            # to ignore t and b during validation we add * in front of underscore
+            img_emb, txt_emb, *_ = model(imgs, text_emb)
             img_chunks.append(img_emb.float())
             txt_chunks.append(txt_emb.float())
 

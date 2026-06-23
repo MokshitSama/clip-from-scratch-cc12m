@@ -1,6 +1,7 @@
 import math
 import time
 from pathlib import Path
+import numpy as np
 
 import torch
 import torch.nn.functional as F
@@ -8,6 +9,42 @@ import torch.distributed as dist
 from torch.amp import autocast
 
 AMP_DTYPE = torch.bfloat16
+
+def siglip_loss(img_emb, txt_emb_pos, txt_emb_neg, t, b):
+    """SigLIP sigmoid loss (Zhai et al. 2023).
+
+    Each (img_i, txt_j) pair is an independent BCE: "is this a real match?"
+    No softmax denominator, no K×K constraint — image and text batch sizes
+    can differ freely.
+
+    Inputs (all on GPU, L2-normalized):
+        img_emb     (K, D)  image embeddings
+        txt_emb_pos (K, D)  text embeddings matched 1-to-1 with the K images
+        txt_emb_neg (M, D)  random extra negative text embeddings
+        t           ()      learnable temperature
+        b           ()      learnable bias
+
+    Returns (loss, acc_i2t, acc_t2i).
+    """
+    
+    K = img_emb.shape[0]
+    device = img_emb.device
+
+    txt_all = torch.cat([txt_emb_pos, txt_emb_neg], dim=0)      # (K + M, D)
+    logits  = t * (img_emb @ txt_all.T) + b                     # (K, K + M)
+
+    labels = -torch.ones_like(logits)
+    diag_idx = torch.arange(K, device=device)
+    labels[diag_idx, diag_idx] = 1.0
+
+    loss = -F.logsigmoid(labels * logits).sum() / K
+
+    with torch.no_grad():
+        acc_i2t = (logits.argmax(dim=1) == diag_idx).float().mean()
+        acc_t2i = (logits[:, :K].T.argmax(dim=1) == diag_idx).float().mean()
+
+    return loss, acc_i2t, acc_t2i
+
 
 
 def lr_schedule_factor(step, total_steps, warmup):
@@ -95,6 +132,9 @@ def train_steps(*, n_steps, model, prefetcher_iter, prefetcher,
                 start_step, total_steps, log, log_state):
     device = accelerator.device
     global_batch = accelerator.num_processes * cfg["per_rank_batch"]   # see note
+
+    n_negs = cfg.get("n_negs", 10_000)       # Negative pool
+
     step = start_step
     end_step = start_step + n_steps
     while step < end_step:
@@ -108,7 +148,17 @@ def train_steps(*, n_steps, model, prefetcher_iter, prefetcher,
         images = gpu_transform(imgs_uint8)                   # (B,3,224,224) float
 
         # CHANGE 1: text comes from memmap, not from a forward pass
-        text_emb_np = text_table[idx.cpu().numpy()]          # (B, 2560) fp16 numpy
+        K = idx.shape[0]
+        pos_np = text_table[idx.cpu().numpy()]
+        neg_idx = np.random.randint(0, 
+                                    text_table.shape[0], 
+                                    size=n_negs) 
+        # so when we do :K we get all positives and K: we get all negatives 
+        # K is the number of positive indexes
+                                                                        
+        neg_np = text_table[neg_idx]                              
+                                                                        
+        text_emb_np = np.concatenate([pos_np, neg_np], axis=0)          # (B, 2560) fp16 numpy
         text_emb = torch.from_numpy(text_emb_np).to(device, non_blocking=True)
 
 
@@ -119,9 +169,9 @@ def train_steps(*, n_steps, model, prefetcher_iter, prefetcher,
 
         with autocast(device_type="cuda", dtype=AMP_DTYPE):
             # CHANGE 2: model signature is (images, text_emb), not (images, ids, mask)
-            img_emb, txt_emb, logit_scale = model(images, text_emb)
-            loss, acc_i2t, acc_t2i = clip_loss_gathered(
-                img_emb, txt_emb, logit_scale, accelerator)
+            img_emb, text_emb_all, t, b = model(images, text_emb)
+            loss, acc_i2t, acc_t2i = siglip_loss(
+                img_emb, text_emb_all[:K], text_emb_all[K:], t, b)
 
         optimizer.zero_grad(set_to_none=True)
         accelerator.backward(loss)
@@ -129,9 +179,6 @@ def train_steps(*, n_steps, model, prefetcher_iter, prefetcher,
             [p for p in model.parameters() if p.requires_grad], cfg["grad_clip"],
         )
         optimizer.step()
-
-        with torch.no_grad():
-            accelerator.unwrap_model(model).log_scale.clamp_(max=math.log(100.0))
 
         # Running stats for log_every (CHANGE 3: state lives in log_state dict,
         # not local vars, so it survives across train_steps calls)
@@ -147,10 +194,11 @@ def train_steps(*, n_steps, model, prefetcher_iter, prefetcher,
             head_lr = optimizer.param_groups[2]["lr"]
             bb_lr   = optimizer.param_groups[0]["lr"]
             log(f"step {step+1:6d}/{total_steps} | "
-                f"loss {log_state['loss']/n:.4f} | scale {logit_scale.item():.2f} | "
+                f"loss {log_state['loss']/n:.4f} | t {t.item():.2f} | b {b.item():+.2f} | "
                 f"lr {head_lr:.2e}/{bb_lr:.2e} (head/bb) | "
-                f"R@1 i2t {log_state['i2t']/n*100:5.1f}% | R@1 t2i {log_state['t2i']/n*100:5.1f}% | "
+                f"R@1 i2t {log_state['i2t']/n*100:5.2f}% | R@1 t2i {log_state['t2i']/n*100:5.1f}% | "
                 f"{sps:.0f} samples/s")
+
             log_state["loss"] = log_state["i2t"] = log_state["t2i"] = 0.0
             log_state["n"] = 0
             log_state["t_log"] = now
