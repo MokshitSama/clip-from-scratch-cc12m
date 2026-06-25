@@ -65,6 +65,18 @@ scripts/              # reusable infrastructure (used by training and one-time j
 
 ## Code map (flowcharts)
 
+This repo follows the original CLIP recipe of [Radford et al. 2021](https://arxiv.org/abs/2103.00020)
+— InfoNCE on image–caption pairs, symmetric loss, a learned temperature, and an
+all-gathered global batch for the contrastive loss (the latter borrowed from the
+[OpenCLIP](https://github.com/mlfoundations/open_clip) implementation). The
+deliberate departures from the paper are documented in
+[v6 vs v7 — what the pipeline actually bought us](#v6-vs-v7--what-the-pipeline-actually-bought-us):
+we use a small EfficientNet-B1 image backbone, a frozen text encoder
+(retrieval-trained sentence model, then [Qwen3-Embedding-4B](https://huggingface.co/Qwen/Qwen3-Embedding-4B)
+in v7), and ~10M cc12m pairs instead of CLIP's WIT-400M. The diagrams below
+show how those choices wire through the actual code rather than the abstract
+recipe.
+
 ### 1. Module dependencies — what reads what
 
 ```mermaid
@@ -157,11 +169,15 @@ flowchart TD
 
 ### 3. Per-step data flow (inside `train_steps`)
 
+A single training step in v7. Concrete v7 numbers are sprinkled in (5090, B=256
+per rank, world=6). The `par` block shows that workers and the GPU are *not*
+sequenced — they overlap, which is the whole point of the prefetcher.
+
 ```mermaid
 sequenceDiagram
     autonumber
     participant Disk as cc12m .tars
-    participant W as CPU workers (×8)
+    participant W as CPU workers (x8)
     participant PF as PinnedPrefetcher
     participant Aug as GPUTrainTransform
     participant MM as /dev/shm<br/>text_emb.mmap
@@ -169,28 +185,32 @@ sequenceDiagram
     participant DDP as DDP all-reduce
     participant Opt as AdamW
 
-    par data side
+    par data side, runs ~30 ms total
         Disk->>W: read JPEG bytes
-        W->>W: decode (libjpeg draft) + resize 256 + center-crop
-        W->>PF: numpy (uint8 HWC, sample_idx)
+        W->>W: decode (libjpeg draft mode), resize short-side 256, center-crop
+        W->>PF: numpy (uint8 HWC, sample_idx int64)
         PF->>PF: copy into persistent pinned host buffer
-        PF-->>Aug: async H2D on side stream<br/>(overlaps with prior step compute)
-    and compute side (prior step)
-        Mdl->>Opt: backward + step (still running)
+        PF-->>Aug: H2D async on side stream (overlaps with prior step compute)
+    and compute side, prior step ~240 ms
+        Mdl->>Opt: backward, AdamW.step (still running)
     end
-    Note over Aug,Opt: wait_stream fence — default stream waits for H2D
+    Note over Aug,Opt: wait_stream fence: default stream blocks until H2D done
 
-    Aug->>Aug: RRC + HFlip + ColorJitter + Normalize
-    Aug->>Mdl: (B, 3, 224, 224) float
-    MM-->>Mdl: text_table[sample_idx] → (B, 2560) fp16
-    Mdl->>Mdl: image_backbone + image_projector + L2 norm
-    Mdl->>Mdl: text_projector + L2 norm
-    Mdl->>DDP: all_gather (img_emb, txt_emb) across ranks
-    DDP-->>Mdl: global tensors of size (world_size · B, embed_dim)
-    Mdl->>Mdl: clip_loss_gathered<br/>(symmetric InfoNCE on global batch)
-    Mdl->>Opt: backward + grad clip
-    Opt->>Mdl: parameter update
+    Aug->>Aug: GPU aug RRC, HFlip, ColorJitter, ImageNet normalize (~5 ms)
+    Aug->>Mdl: imgs (B, 3, 224, 224) bf16
+    MM-->>Mdl: text_table[sample_idx] -> (B, 2560) fp16
+    Mdl->>Mdl: image_backbone, image_projector, L2 normalize
+    Mdl->>Mdl: text_projector, L2 normalize (text is frozen, so no backbone fwd)
+    Mdl->>DDP: all_gather (img_emb, txt_emb)
+    DDP-->>Mdl: global tensors (world_size * B, embed_dim)
+    Mdl->>Mdl: clip_loss_gathered: symmetric InfoNCE on the global batch
+    Mdl->>Opt: backward, grad_clip 1.0
+    Opt->>Mdl: AdamW step, log_scale clamp(<=100)
 ```
+
+`+` is a reserved character inside Mermaid sequence-diagram message bodies
+(it triggers actor activation), which is why this diagram uses commas to
+separate steps instead.
 
 ### 4. One-time embedding extraction (independent setup)
 
@@ -458,3 +478,43 @@ a 1M val is statistically more reliable but also a strictly harder problem.
 Work in progress. Reproducing CLIP-quality retrieval numbers needs much more data than
 cc12m alone (the original paper used 400 M pairs); this repo is more about understanding
 the recipe end-to-end than about competing with the reference.
+
+## References
+
+The original work this implementation is based on, and the pretrained models we
+plug in along the way:
+
+- **CLIP** — Radford *et al.* 2021. *Learning Transferable Visual Models From
+  Natural Language Supervision.* [arxiv 2103.00020](https://arxiv.org/abs/2103.00020).
+  The recipe — InfoNCE on (image, caption) pairs, symmetric loss, learned
+  temperature.
+- **SigLIP** — Zhai *et al.* 2023. *Sigmoid Loss for Language Image
+  Pre-Training.* [arxiv 2303.15343](https://arxiv.org/abs/2303.15343). The
+  basis for the v8 branch (decoupled image/text batch sizes, sigmoid loss).
+- **OpenCLIP** — Ilharco *et al.* 2021–. [github.com/mlfoundations/open_clip](https://github.com/mlfoundations/open_clip).
+  Source of the "gather features across ranks, splice the local slice back in"
+  trick we use in `gather_features` so the DDP-gathered global batch is still
+  differentiable.
+- **CC12M** — Changpinyo *et al.* 2021. *Conceptual 12M: Pushing Web-Scale
+  Image-Text Pre-Training To Recognize Long-Tail Visual Concepts.*
+  [github.com/google-research-datasets/conceptual-12m](https://github.com/google-research-datasets/conceptual-12m).
+  The dataset.
+- **BAAI/bge-base-en-v1.5** — frozen text encoder used in v5/v6.
+  [huggingface.co/BAAI/bge-base-en-v1.5](https://huggingface.co/BAAI/bge-base-en-v1.5).
+- **Qwen3-Embedding-4B** — frozen text encoder used in v7. 2560-dim, last-token
+  pool, retrieval-tuned at LLM scale.
+  [huggingface.co/Qwen/Qwen3-Embedding-4B](https://huggingface.co/Qwen/Qwen3-Embedding-4B).
+- **timm** — Ross Wightman. [github.com/huggingface/pytorch-image-models](https://github.com/huggingface/pytorch-image-models).
+  Source of `tf_efficientnet_b1.aa_in1k` and the rest of the image-backbone
+  ecosystem.
+- **🤗 Accelerate** — [github.com/huggingface/accelerate](https://github.com/huggingface/accelerate).
+  Handles the DDP / NCCL / bf16 plumbing across all 6 ranks.
+- **WebDataset** — Aizman *et al.* [github.com/webdataset/webdataset](https://github.com/webdataset/webdataset).
+  The shard-streaming loader pattern over cc12m tars.
+
+All deviations from the original CLIP recipe (smaller backbone, frozen text,
+cc12m data scale) are documented inline in the
+[v6 vs v7](#v6-vs-v7--what-the-pipeline-actually-bought-us) and
+[scaling vs OpenAI CLIP / OpenCLIP](#where-we-stand-vs-openai-clip--openclip--on-the-same-5000-pair-eval)
+sections above. The point of this repo is to **understand** the recipe by
+re-deriving every line of it, not to compete with the reference numbers.
