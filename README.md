@@ -13,37 +13,59 @@ Multi-GPU with 🤗 Accelerate, using the OpenCLIP "gather features" trick so th
 contrastive loss is computed over the full *global* batch rather than each rank's local
 slice — i.e. on N GPUs at batch B per rank, every anchor sees N·B − 1 negatives, not B − 1.
 
+> **TL;DR — current state.** Three versions cover the story: v6 is the trainable-text
+> InfoNCE baseline (4.53 % R@1 on 1M-pair held-out val, 22.4 h on 6×5090); v7 froze the
+> text encoder and rebuilt the pipeline for a 2× throughput win but lost 2 R@1
+> (2.47 %, 12.9 h); v8 is running now with SigLIP loss + K=64 image batch + 1024
+> random text negatives per step and has already cleared v6 (5.15 % R@1 at epoch 9
+> of 20, still climbing). Full walkthrough in
+> [Performance pipeline](#performance-pipeline-v6-speedups) →
+> [v6 vs v7](#v6-vs-v7--what-the-pipeline-actually-bought-us) →
+> [v8 — SigLIP](#v8--siglip-recovers-the-quality-v7-lost-branch).
+
 ## Architecture
 
 ```
-image (224x224) -> EfficientNet B1 (pretrained, trainable) -> 1280 -> MLP -> 512 ─┐
-                                                                                    ├─ cosine sim
-text  (≤64 tok) -> BGE-base-en-v1.5 (pretrained, frozen)    ->  768 -> MLP -> 512 ─┘
-                                                                             ↑
-                                                                 learned log-scale
-                                                                 temperature (init 0)
+image (224x224) -> EfficientNet B1 (ImageNet-pretrained, trainable) -> 1280 -> MLP -> 512 ─┐
+                                                                                            ├─ cosine sim
+text  (raw caption) -> Qwen3-Embedding-4B (frozen, precomputed to /dev/shm) -> 2560 -> MLP -> 512 ─┘
+                                                                                            ↑
+                                                                                 v6/v7: log_scale (init 0)
+                                                                                 v8:    (t=exp(t_prime) init 10, b init -10)
 ```
+
+At the current v7 / v8 configuration (frozen text encoder, precomputed embeddings):
 
 | Component | Params | Notes |
 |---|---:|---|
 | EfficientNet B1 backbone | 6.5 M | ImageNet-pretrained, trainable |
-| BGE-base-en-v1.5 backbone | 109 M | frozen, `[CLS]` of last hidden state |
-| Image projector | 1.6 M | 2-layer MLP (GELU) |
-| Text projector | 1.3 M | 2-layer MLP (GELU) |
-| `log_scale` | 1 | learned |
-| **Trainable total** | **9.7 M** | |
+| Image projector | 1.6 M | 2-layer MLP (GELU): 1280 → 1024 → 512 |
+| Text projector | 3.4 M | 2-layer MLP (GELU): 2560 → 1024 → 512 |
+| Learned scalars | 1 (v6/v7) / 2 (v8) | temperature (+ bias in v8) |
+| **Trainable total** | **11.5 M** | v6 was 118.6 M because the BGE text encoder trained too |
 
 ## Files
 
 ```
-model.py              # CLIPModel + clip_loss + Projector
-build_loader.py       # WebDataset streaming loader over cc12m shards
-build_val_set.py      # one-shot script to materialize the held-out val tensors
-train.py              # multi-GPU training loop with gathered-features contrastive loss
-evaluate.py           # eval R@{1,5,10} + mean rank on a checkpoint
-config.yaml           # all tunable hyperparameters
+train_precomp.py      # main training entrypoint (precomp pipeline). Builds loader +
+                      # prefetcher + transforms + model + optimizer, runs the
+                      # eval-interval loop calling train_steps + validate.
+train_utils.py        # train_steps inner loop, lr_schedule_factor, gather_features,
+                      # clip_loss_gathered (v6/v7), siglip_loss (v8),
+                      # save_ckpt, manage_ckpts.
+eval_utils.py         # validate (1M-pair pass) + streaming_metrics (R@k + mean rank).
+model.py              # CLIPPrecompModel (image bb + projectors + learned scalars) +
+                      # Projector. CLIPModel (v6 dual-tower) kept for benchmark.py /
+                      # evaluate.py compatibility.
+dataset.py            # WebDataset streaming loader. JPEG decode + 256-crop → uint8 HWC
+                      # + sample_idx (the cc12m stem parsed as int, used as memmap row).
+benchmark.py          # v6 + v7 vs OpenAI CLIP / OpenCLIP cc12m on the 5000-pair set.
+evaluate.py           # R@{1,5,10} on a single v6 checkpoint (legacy, used by v6 ckpts).
+run_train.sh          # launcher: sets CUDA_DEVICE_ORDER=PCI_BUS_ID and the 5090 GPU
+                      # mask, then accelerate launch train_precomp.py.
+config.yaml           # all tunable hyperparameters.
 
-scripts/              # performance pipeline (precomputed embeddings + GPU aug + async H2D)
+scripts/              # reusable infrastructure (used by training and one-time jobs)
   embedding_extract.py    # 6-rank Qwen3-Embedding-4B extractor → text_emb.mmap
   run_extract.sh          # launcher for the 6× 5090 extraction job
   gpu_transforms.py       # GPU-side RRC + HFlip + ColorJitter + Normalize
@@ -65,43 +87,43 @@ accelerate config
 # pick: MULTI_GPU, num_processes = (how many GPUs you have), mixed_precision = bf16
 ```
 
-Point `build_loader.SHARDS` at your cc12m tar files (they default to
-`/mnt/md0/cc12m/cc12m-train-{0000..2175}.tar` minus shard 0020, which is held out for
-validation).
+Point the `TRAIN_SHARDS` / `VAL_SHARDS` lists at the top of `dataset.py` at your
+cc12m tar files. They default to
+`/mnt/md0/cc12m/cc12m-train-{0000..2175}.tar`, with shards 0020–0219 held out
+as the validation range.
 
 ## Validation set
 
-The val set is streamed from cc12m shards **0020-0219** at eval time (~1M pairs).
-Nothing to pre-build — the loader just opens those shards each time eval runs.
-Training reads shards 0000-0019 + 0220-2175 (~9.96 M pairs).
-
-The earlier `build_val_set.py` script pre-extracted 5,000 tensors to disk — kept
-around for historical compatibility but no longer used by `train.py`.
+The 1M-pair val is streamed from cc12m shards **0020–0219** at eval time —
+nothing to pre-build. Training reads the remaining 1976 shards
+(0000–0019 + 0220–2175, ~9.96 M pairs). A small cached 5000-pair tensor
+(`val_set_cc12m_0020_5000.pt`) is kept for `benchmark.py` — the
+apples-to-apples comparison against OpenAI CLIP / OpenCLIP uses that
+exact set.
 
 ## Train
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,5,6 VERSION=3 accelerate launch train.py
+VERSION=8 ./run_train.sh
 ```
 
-`VERSION=N` sets the output directory to `runs/vN/`. `runs/vN/` is wiped at startup if it
-exists, so just bump the version number for each new attempt. Logs stream to stdout and to
-`runs/vN/train.log`; the resolved config snapshot is dumped alongside as
-`config.snapshot.yaml`. Checkpoint management keeps only `best` (highest avg held-out R@1
-so far) and `last` (most recent) on disk.
-
-You can also override the version via the `--version` flag instead of `VERSION=...`:
-
-```bash
-accelerate launch train.py --version 3
-```
+The launcher (`run_train.sh`) sets `CUDA_DEVICE_ORDER=PCI_BUS_ID` and
+`CUDA_VISIBLE_DEVICES=0,1,2,3,5,6` (the six 5090s; the 3090 at index 4 is
+skipped), then hands off to `accelerate launch train_precomp.py`. Both the
+env-hygiene and the `VERSION` env var are required. `VERSION=N` sets the
+output dir to `runs/vN/`, which is wiped at startup — bump `N` per attempt.
+Logs stream to stdout and `runs/vN/train.log`; the resolved config snapshot
+is dumped as `runs/vN/config.snapshot.yaml`. Checkpoint management keeps
+only `best` (highest avg held-out R@1) and `last` on disk.
 
 ## Evaluate
 
 ```bash
-python evaluate.py runs/v3/checkpoints/ckpt_step00007137.pt
-# or evaluate every checkpoint in a directory:
-python evaluate.py runs/v3/checkpoints/  --csv runs/v3/eval.csv
+# 5000-pair apples-to-apples table: v6 + v7 vs OpenAI CLIP / OpenCLIP cc12m
+CUDA_VISIBLE_DEVICES=0 python benchmark.py
+
+# Single-checkpoint R@1/5/10 + mean rank (v6 CLIPModel only — pre-precomp models)
+python evaluate.py runs/v6/checkpoints/ckpt_step00123196.pt
 ```
 
 ## Hyperparameters
@@ -110,17 +132,24 @@ Defaults in `config.yaml`:
 
 | key | default | notes |
 |---|---|---|
-| `epochs` | 5 | ~0.7 h/epoch on 6× 5090 |
+| `epochs` | 20 | ~40 min/epoch on 6×5090 at v7 settings; slower at v8's smaller image batch |
 | `warmup_steps` | 2000 | linear → cosine to 0 |
-| `base_lr` | 5e-4 | bump to 1e-3 for ResNet from-scratch |
-| `weight_decay` | 0.1 | excluded from biases, LayerNorm, `log_scale`, ViT-specific tokens |
+| `base_lr` | 5e-4 | head LR; backbone LR = `base_lr × backbone_lr_mult` |
+| `backbone_lr_mult` | 0.2 | gentler updates on the pretrained image backbone |
+| `weight_decay` | 0.1 | excluded from biases, LayerNorm, learned scalars, ViT-specific tokens |
 | `grad_clip` | 1.0 | |
-| `eval_every_frac` | 4 | 4 evals per epoch (~15 min on 6× 5090) |
+| `eval_every_frac` | 1 | evals per epoch (~7 min per 1M-pair eval on 6×5090) |
 | `log_every` | 50 | in-batch metrics cadence |
+| `n_negs` | 1024 | **v8 only** — random text negatives per anchor per step, drawn from /dev/shm memmap ([#18](https://github.com/MokshitSama/clip-from-scratch-cc12m/issues/18) for why not larger yet) |
 
-The contrastive temperature `log_scale` is a *learned* parameter (init 0 → scale 1), clamped
-to `exp(log_scale) ≤ 100` to prevent runaway. Init at scale 1 (flat softmax) forces the model
-to learn real embedding separation before the temperature can sharpen the loss artificially.
+### Learned temperature / bias
+
+- **v6/v7 (InfoNCE)**: single scalar `log_scale`, init 0 (scale 1), clamped at
+  `exp(log_scale) ≤ 100`. Flat-softmax init forces real embedding separation
+  before the temperature can artificially sharpen the loss.
+- **v8 (SigLIP)**: two scalars `t = exp(t_prime)` with `t_prime` init `log(10)` (so
+  `t = 10`) and `b` init `-10`. No clamp on `t` — the negative-shifted bias
+  handles the heavy negative pool (paper §3.2).
 
 ## Notes on the setup
 
@@ -137,8 +166,11 @@ to learn real embedding separation before the temperature can sharpen the loss a
 
 ## Performance pipeline (v6+ speedups)
 
-Profiling the v6 step revealed three stacked bottlenecks. Each one has its
-own GitHub issue with measurements + fix details:
+> **TL;DR.** Three stacked v6 bottlenecks fixed once — the frozen text encoder
+> forward becomes a memmap lookup, CPU augmentation moves to the GPU, and the
+> H2D copy of each image batch overlaps with the previous step's compute. Net
+> effect: v7 runs at ~5,650 samples/s vs v6's ~2,800 — a **2× throughput win**
+> on the same 6×5090 box.
 
 | # | Bottleneck (before) | Approach | Win |
 |---|---|---|---|
@@ -152,6 +184,14 @@ Worth-knowing gotcha caught while landing the above:
 The training rewrite that actually consumes all three speedups is `train_precomp.py` — text tower removed, memmap row lookup at the index, `GPUTrainTransform`, `PinnedPrefetcher`.
 
 ## v6 vs v7 — what the pipeline actually bought us
+
+> **TL;DR.** Pipeline wise, v7 wins outright: 2× throughput, 42 % less
+> wall-clock, 270 ms saved per step. Quality wise, v7 *loses* by ~2 R@1
+> on the same 1M-pair held-out val, because freezing the text encoder
+> removed ~107 M of joint-adaptation capacity. Even a much stronger frozen
+> encoder (Qwen3-Embedding-4B) doesn't make up for losing the ability to
+> bend text toward the visual distribution. v7's role is as **the infra**,
+> not as the model.
 
 v6 and v7 ran the exact same 20-epoch schedule over the same train shards
 on the same 6×5090 box. The only differences: v7's text tower is gone
@@ -195,6 +235,12 @@ infra"** — we now have a scalable, throughput-friendly chassis. The
 next step is to put *the right model* on top of it.
 
 ## Where we stand vs OpenAI CLIP & OpenCLIP — on the same 5000-pair eval
+
+> **TL;DR.** Data quantity + quality are the biggest levers, not the recipe.
+> OpenAI CLIP B/16 has similar trainable capacity to v6 (~120–150 M) but was
+> trained on ~40× more, cleaner data (WIT-400M vs cc12m's 11 M) and clears
+> v6 by +15 R@1. Even with infinite compute on cc12m we'd plateau in the
+> mid-50s % because the captions are noisier and narrower than WIT.
 
 | Model | Params | i2t R@1 | t2i R@1 | mean rank | Notes |
 |---|---:|---:|---:|---:|---|
@@ -243,6 +289,14 @@ This is what the `v8-siglip` branch implements. The next section reports
 the numbers.
 
 ## v8 — SigLIP recovers the quality v7 lost ([branch](https://github.com/MokshitSama/clip-from-scratch-cc12m/tree/v8-siglip))
+
+> **TL;DR.** Swap InfoNCE → sigmoid (SigLIP), drop image batch from 256 to 64,
+> pull `n_negs=1024` random extra text negatives per step from the /dev/shm
+> memmap. Each pair is independent BCE, so image and text batch sizes can
+> differ freely — image forward is 4× cheaper, and the model still sees
+> ~1088 candidates per anchor. Result at the epoch-9 checkpoint: **5.15 %
+> R@1 on 1M-pair held-out val** — already above v6's *final* number (4.53 %)
+> at less than half the schedule, on v7's pipeline. Still climbing.
 
 v8 keeps v7's frozen-text pipeline but swaps two things:
 - **Smaller image batch**, `BATCH_SIZE = 64` per rank (vs v7's 256). Image
