@@ -294,9 +294,10 @@ the numbers.
 > pull `n_negs=1024` random extra text negatives per step from the /dev/shm
 > memmap. Each pair is independent BCE, so image and text batch sizes can
 > differ freely — image forward is 4× cheaper, and the model still sees
-> ~1088 candidates per anchor. Result at the epoch-9 checkpoint: **5.15 %
-> R@1 on 1M-pair held-out val** — already above v6's *final* number (4.53 %)
-> at less than half the schedule, on v7's pipeline. Still climbing.
+> ~1088 candidates per anchor. Run stopped at **epoch 9 / 20** to free GPUs
+> for the next project; best held-out **5.15 % R@1 on 1M-pair val** — already
+> above v6's *final* number (4.53 %) at less than half the schedule, on v7's
+> pipeline. Slope was decelerating but still positive at the stop point.
 
 v8 keeps v7's frozen-text pipeline but swaps two things:
 - **Smaller image batch**, `BATCH_SIZE = 64` per rank (vs v7's 256). Image
@@ -325,23 +326,36 @@ ranks. The `PinnedPrefetcher` only covered the image side; the text side
 is still synchronous and will go through a similar prefetcher refactor
 before raising `n_negs` again.
 
-### Numbers so far (run still in progress)
+### Numbers (run stopped at epoch 9 / 20 to free GPUs)
 
-Snapshot at step 233,442 / 518,760 (epoch 9 / 20, ~45 % through):
+Final state at step 233,442 / 518,760 (~45 % through the schedule):
 
-| | v6 | v7 | v8 (running, epoch 9) |
+| | v6 | v7 | v8 (stopped, epoch 9) |
 |---|---|---|---|
 | Text encoder | trainable BGE-base | frozen Qwen3-Emb-4B (lookup) | frozen Qwen3-Emb-4B (lookup) |
 | Loss | InfoNCE (gathered) | InfoNCE (gathered) | SigLIP (no gather) |
 | Per-rank batch / negatives per anchor | 256 / 1535 | 256 / 1535 | **64 / 1088** |
 | Trainable params | 118.6 M | 11.5 M | 11.5 M |
 | Throughput | ~2,800 sps | ~5,650 sps | ~3,800 sps |
-| 1M-pair val avg R@1 (best) | 4.528 % | 2.466 % | **5.15 %** *(epoch 9)* |
-| vs v6 | — | −2.06 | **+0.62 (already)** |
+| 1M-pair val avg R@1 (best) | 4.528 % | 2.466 % | **5.153 %** *(ckpt_step00233442)* |
+| vs v6 | — | −2.062 | **+0.625** |
 
-v8 surpassed v6's *final* number at less than half its schedule. The
-trajectory is still climbing (4.65 → 4.99 → 5.15 across the last three
-epochs); the run is expected to land at 6.0–7.0 % by epoch 20.
+v8 surpassed v6's *final* number at less than half its schedule. Full
+per-epoch trajectory on 1M held-out val:
+
+```
+epoch 1: 2.944 %   epoch 4: 4.121 %   epoch 7: 4.648 %
+epoch 2: 3.594 %   epoch 5: 4.311 %   epoch 8: 4.986 %
+epoch 3: 3.871 %   epoch 6: 4.568 %   epoch 9: 5.153 %  ← last
+```
+
+Slope was decelerating (+0.34 → +0.17 in the last two epochs) but still
+positive. Cosine LR would have starved the gradient signal in the last
+third of training regardless. Honest read: **the "SigLIP with cheap
+negatives recovers what v7 lost" claim is proven at +0.63 over v6, and the
+2× throughput cost of v8's smaller batch is real — 3800 vs v7's 5650 sps**.
+If we'd let it finish, the projected 6-7 % landing was on-slope but not
+guaranteed; the point stands at 5.15 %.
 
 The verdict the v7 writeup hoped for landed: **freezing the text encoder
 costs you R@1 under InfoNCE, but SigLIP with many cheap negatives
@@ -365,7 +379,7 @@ a 1M val is statistically more reliable but also a strictly harder problem.
 | v5 | EfficientNet B1 (pretrained) + BGE-base text encoder, 1M val, 20 epochs, eval 1x/epoch | replaced ResNet-50 → EfficientNet B1 (6.5M vs 23.5M); BERT-base → BGE-base-en-v1.5 (same params, retrieval-trained); val 5k → 1M; eval 4x → 1x per epoch | smaller image bb might cap representation; BGE should noticeably improve text side; 1M val is more reliable but harder than 5k → R@1 numbers may look *lower* even if model is better | _early run; superseded by v6_ | _n/a_ |
 | v6 | EfficientNet B1 + **trainable** BGE-base text encoder, 20 epochs, eval 4x/epoch, 1M val | unfroze the text encoder so both backbones train jointly; otherwise same as v5 | trainable text should give text side flexibility to align to images → bigger R@1 lift than v5 | **R@1 = 4.528%** at epoch 19 (`ckpt_step00123196.pt`); 22.4 h on 6×5090 | best to date |
 | v7 | EfficientNet B1 + **precomputed** Qwen3-Embedding-4B text (frozen), 20 epochs, eval 1x/epoch, 1M val | text encoder forward removed entirely (memmap row lookup); on-GPU augmentation; pinned-buffer async H2D; tested SigLIP-style infrastructure | with much stronger frozen text emb + same image bb, expect R@1 comparable or slightly better than v6; pipeline should be ~2× faster | **R@1 = 2.466%** (lower); 12.87 h on 6×5090 (1.74× faster wall-clock). Quality regressed because frozen text can't bend toward visual distribution; pipeline win is real | −2.06 vs v6 |
-| v8 | Same frozen Qwen3-Emb-4B but **SigLIP loss** with per-rank batch 64 and `n_negs=1024` random text negatives per step; otherwise same as v7 | softmax InfoNCE → sigmoid BCE; image batch 256 → 64 (4× cheaper fwd); text negatives 1535 (in-batch) → 1088 (most pulled from /dev/shm); no DDP gather of features | sigmoid loss + many cheap negatives should recover the joint-adaptation R@1 v7 lost to freezing text, while staying on v7's pipeline | (run in progress) — **5.15 %** at step 233k of 519k (epoch 9 of 20). Already above v6's final. Trajectory still climbing; projecting 6–7 % by epoch 20. Early `n_negs=10_000` attempt was 17× slower than v7 — see [#18](https://github.com/MokshitSama/clip-from-scratch-cc12m/issues/18) | **+0.62** vs v6 (so far) |
+| v8 | Same frozen Qwen3-Emb-4B but **SigLIP loss** with per-rank batch 64 and `n_negs=1024` random text negatives per step; otherwise same as v7 | softmax InfoNCE → sigmoid BCE; image batch 256 → 64 (4× cheaper fwd); text negatives 1535 (in-batch) → 1088 (most pulled from /dev/shm); no DDP gather of features | sigmoid loss + many cheap negatives should recover the joint-adaptation R@1 v7 lost to freezing text, while staying on v7's pipeline | **R@1 = 5.153 %** at epoch 9 / 20 (`ckpt_step00233442.pt`); run stopped mid-schedule to free GPUs for the next project. Slope still positive at stop but decelerating; projected 6-7 % if allowed to finish. Early `n_negs=10_000` attempt was 17× slower than v7 — see [#18](https://github.com/MokshitSama/clip-from-scratch-cc12m/issues/18) | **+0.625** vs v6 |
 
 ## Notes on choosing each piece
 
